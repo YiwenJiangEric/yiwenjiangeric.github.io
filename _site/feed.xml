@@ -1,0 +1,2581 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>吴斌</title>
+    <description>欢迎来到我的技术博客~</description>
+    <link>http://localhost:4000/</link>
+    <atom:link href="http://localhost:4000/feed.xml" rel="self" type="application/rss+xml"/>
+    <pubDate>Tue, 22 May 2018 17:00:55 +0800</pubDate>
+    <lastBuildDate>Tue, 22 May 2018 17:00:55 +0800</lastBuildDate>
+    <generator>Jekyll v3.4.0</generator>
+    
+      <item>
+        <title>【SPDK】七、vhost客户端连接请求处理</title>
+        <description>&lt;p&gt;  vhost客户端连接后，将遵循vhost协议进行一系统复杂的消息传递与处理过程，最终服务端将生成一个可处理IO环中请求并返回响应的处理线程。本篇博文将分析其中最为重要两类消息的处理原理：内存映射消息和IO环信息传递消息。最后将一起来看一下vhost通用消息处理完成后，vhost-blk设备是如何完成最后的初始化动作的(其它类型的vhost设备大家可以自行阅读代码分析)。&lt;/p&gt;
+
+&lt;h3 id=&quot;vhost内存映射&quot;&gt;vhost内存映射&lt;/h3&gt;
+
+&lt;p&gt;  vhost的reactor线程在处理IO请求时，需要访问虚拟机的内存空间。我们知道，虚拟机可见的内存是由qemu进程分配的，通过KVM内核模块将内存映射关系记录到EPT页表中(CPU硬件提供的地址转换功能)，以此实现从GPA(Guest Physical Address)到HPA(Host Physical Address)的转换。同时qemu分配的这部分内存会映射到qemu虚拟地址空间中(Qemu Virtual Adress)，以便qemu进程中IO线程可以访问虚拟机内存。映射关系如下图所示：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/spdk/memory.jpg&quot; height=&quot;400&quot; width=&quot;550&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  SPDK中vhost进程将取代qemu IO线程对IO进行处理，因此它也需要将虚拟机可见地址映射到自身的虚拟地址空间中(Vhost Virtual Address)，并记录VVA到HPA的映射关系，便于将HPA发送给物理存储控制器进行DMA操作。&lt;/p&gt;
+
+&lt;p&gt;  vhost进程映射虚拟机地址的基本原理就是通过大页内存的mmap系统调用：&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;qemu进程通过大页文件(/dev/hugepages/xxx)为虚拟机申请内存，然后将大页文件句柄传递给vhost进程；&lt;/li&gt;
+  &lt;li&gt;vhost进程接收句柄后，会识别到qemu创建的大页文件(/dev/hugepages/xxx)，然后调用mmap系统调用将该大页文件映射到自身虚拟地址空间中。&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;  下面我们结合代码，再来深入理解一下内存映射过程。首先qemu连接vhost进程后，会通过发送VHOST_USER_SET_MEM_TABLE消息传递qemu内部的内存映射信息，vhost对该消息的处理过程如下：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/rte_vhost/vhost_user.c:
+
+static int
+vhost_user_set_mem_table(struct virtio_net *dev, struct VhostUserMsg *pmsg)
+{
+    uint32_t i;
+
+    memcpy(&amp;amp;dev-&amp;gt;mem_table, &amp;amp;pmsg-&amp;gt;payload.memory, sizeof(dev-&amp;gt;mem_table));
+    memcpy(dev-&amp;gt;mem_table_fds, pmsg-&amp;gt;fds, sizeof(dev-&amp;gt;mem_table_fds));
+    dev-&amp;gt;has_new_mem_table = 1;
+    
+    ...
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  从上述代码，我们可以看到这里仅是简单地将socket消息中内容复制到dev对象中。注意一点，这里的dev代表客户端对象；对象类型名为virtio_net是由于这部分代码完全借用自DPDK导致，并不是说客户端是一个virtio_net对象。&lt;/p&gt;
+
+&lt;p&gt;  后续在进行gpa地址转换前，后续通过vhost_setup_mem_table完成内存映射：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/rte_vhost/vhost_user.c:
+
+static int
+vhost_setup_mem_table(struct virtio_net *dev)
+{
+    struct VhostUserMemory memory = dev-&amp;gt;mem_table;
+    struct rte_vhost_mem_region *reg;
+    void *mmap_addr;
+    uint64_t mmap_size;
+    uint64_t mmap_offset;
+    uint64_t alignment;
+    uint32_t i;
+    int fd;
+
+    ...
+    dev-&amp;gt;mem = rte_zmalloc(&quot;vhost-mem-table&quot;, sizeof(struct rte_vhost_memory) +
+            sizeof(struct rte_vhost_mem_region) * memory.nregions, 0);
+    dev-&amp;gt;mem-&amp;gt;nregions = memory.nregions;
+
+    for (i = 0; i &amp;lt; memory.nregions; i++) {
+        fd  = dev-&amp;gt;mem_table_fds[i]; /* 取出大页文件句柄，注，这里是经过内核处理后的句柄，不是qemu中的原始句柄号 */
+        reg = &amp;amp;dev-&amp;gt;mem-&amp;gt;regions[i];
+
+        reg-&amp;gt;guest_phys_addr = memory.regions[i].guest_phys_addr; /* 虚拟机物理内存地址，gpa*/
+        reg-&amp;gt;guest_user_addr = memory.regions[i].userspace_addr;  /* qemu中的虚拟地址，qva*/
+        reg-&amp;gt;size            = memory.regions[i].memory_size;     /* 内存段大小 */
+        reg-&amp;gt;fd              = fd;
+
+        mmap_offset = memory.regions[i].mmap_offset; /* 映射段内偏移，通常为零 */
+        mmap_size   = reg-&amp;gt;size + mmap_offset;       /* 映射段大小 */
+
+        ...
+
+        /* 将大页文件重新映射到当前进程中 */
+        mmap_addr = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
+
+        reg-&amp;gt;mmap_addr = mmap_addr;
+        reg-&amp;gt;mmap_size = mmap_size;
+        reg-&amp;gt;host_user_addr = (uint64_t)(uintptr_t)mmap_addr + mmap_offset; /* vhost虚拟地址，vva */
+
+        ...
+    }
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h3 id=&quot;vhost-io环信息传递&quot;&gt;vhost IO环信息传递&lt;/h3&gt;
+
+&lt;p&gt;  vhost内存映射完成后，便可进行IO环信息的传递，处理完成后使得vhost进程可以访问IO环中信息。&lt;/p&gt;
+
+&lt;p&gt;  这里注意一点，vhost在处理IO环相关消息时，首先会通过vhost_user_check_and_alloc_queue_pair来创建IO环相关对象。IO环相关的消息主要有VHOST_USER_SET_VRING_NUM、VHOST_USER_SET_VRING_ADDR、VHOST_USER_SET_VRING_BASE、VHOST_USER_SET_VRING_KICK、VHOST_USER_SET_VRING_CALL，这里我们重点分析一下VHOST_USER_SET_VRING_ADDR消息的处理：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/rte_vhost/vhost_user.c:
+
+static int
+vhost_user_set_vring_addr(struct virtio_net *dev, VhostUserMsg *msg)
+{
+    struct vhost_virtqueue *vq;
+    uint64_t len;
+
+    /* 如果还未完成vhost内存的映射，则先进行内存映射，可参考前文分析 */
+    if (dev-&amp;gt;has_new_mem_table) {
+        vhost_setup_mem_table(dev);
+        dev-&amp;gt;has_new_mem_table = 0;
+    }
+    ...
+
+    /* 根据消息中的索引找到对应的vq对象 */
+    vq = dev-&amp;gt;virtqueue[msg-&amp;gt;payload.addr.index];
+
+    /* The addresses are converted from QEMU virtual to Vhost virtual. */
+    len = sizeof(struct vring_desc) * vq-&amp;gt;size;
+    /* 将消息中包含的desc数组的qva地址转换成vva地址，便于vhost线程后续访问IO环中desc数组中内容 */
+    vq-&amp;gt;desc = (struct vring_desc *)(uintptr_t)qva_to_vva(dev, msg-&amp;gt;payload.addr.desc_user_addr, &amp;amp;len);
+
+    dev = numa_realloc(dev, msg-&amp;gt;payload.addr.index);
+    vq = dev-&amp;gt;virtqueue[msg-&amp;gt;payload.addr.index];
+
+    /* 同理将avail数组的qva地址转换成vva地址 */
+    len = sizeof(struct vring_avail) + sizeof(uint16_t) * vq-&amp;gt;size;
+    vq-&amp;gt;avail = (struct vring_avail *)(uintptr_t)qva_to_vva(dev, msg-&amp;gt;payload.addr.avail_user_addr, &amp;amp;len);
+    
+    /* 同理将used数组的qva地址转换成vva地址 */
+    len = sizeof(struct vring_used) + sizeof(struct vring_used_elem) * vq-&amp;gt;size;
+    vq-&amp;gt;used = (struct vring_used *)(uintptr_t)qva_to_vva(dev, msg-&amp;gt;payload.addr.used_user_addr, &amp;amp;len);
+
+    ...
+    return 0;
+}
+
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h3 id=&quot;vhost-blk回调处理&quot;&gt;vhost-blk回调处理&lt;/h3&gt;
+
+&lt;p&gt;  vhost设备完成内存映射及IO环信息传递动作后，就进行不同vhost设备特有的初始化动作：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/rte_vhost/vhost_user.c:
+
+int
+vhost_user_msg_handler(int vid, int fd)
+{
+
+    /* 从socket句柄中读取消息 */
+    ret = read_vhost_message(fd, &amp;amp;msg);
+    ...
+
+    /* 如果消息中涉及IO环则先创建IO环对象 */
+    ret = vhost_user_check_and_alloc_queue_pair(dev, &amp;amp;msg);
+
+    /* 根据不同的消息类型进行处理 */
+    switch (msg.request) {
+    case VHOST_USER_GET_CONFIG:
+    ...
+    }
+
+    if (!(dev-&amp;gt;flags &amp;amp; VIRTIO_DEV_RUNNING) &amp;amp;&amp;amp; virtio_is_ready(dev)) {
+        dev-&amp;gt;flags |= VIRTIO_DEV_READY;
+
+        if (!(dev-&amp;gt;flags &amp;amp; VIRTIO_DEV_RUNNING)) {
+
+            /* 通过notify_ops回调设备相关的初始化函数 */
+            if (dev-&amp;gt;notify_ops-&amp;gt;new_device(dev-&amp;gt;vid) == 0)
+                dev-&amp;gt;flags |= VIRTIO_DEV_RUNNING;
+        }
+    }
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  g_spdk_vhost_ops的new_device函数指向start_device，这里仍是vhost设备通用的初始化逻辑：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/vhost.c:
+
+static int
+start_device(int vid)
+{
+    struct spdk_vhost_dev *vdev;
+    int rc = -1;
+    uint16_t i;
+
+    /* 根据客户端vid找到对应的vhost_dev设备 */
+    vdev = spdk_vhost_dev_find_by_vid(vid);
+
+    /* 将客户端对象(virtio_net)中记录的IO环信息同步一份到vhost_dev中，后续IO处理时主要操作vhost_dev对象 */
+    vdev-&amp;gt;max_queues = 0;
+    memset(vdev-&amp;gt;virtqueue, 0, sizeof(vdev-&amp;gt;virtqueue));
+    for (i = 0; i &amp;lt; SPDK_VHOST_MAX_VQUEUES; i++) {
+        if (rte_vhost_get_vhost_vring(vid, i, &amp;amp;vdev-&amp;gt;virtqueue[i].vring)) {
+            continue;
+        }
+
+        if (vdev-&amp;gt;virtqueue[i].vring.desc == NULL ||
+                vdev-&amp;gt;virtqueue[i].vring.size == 0) {
+            continue;
+        }
+
+        /* Disable notifications. */
+        if (rte_vhost_enable_guest_notification(vid, i, 0) != 0) {
+            SPDK_ERRLOG(&quot;vhost device %d: Failed to disable guest notification on queue %&quot;PRIu16&quot;\n&quot;, vid, i);
+            goto out;
+        }
+
+        vdev-&amp;gt;max_queues = i + 1;
+    }
+
+    /* 同理，将客户端对象中的内存映射表同步一份到vhost_dev中 */
+    if (rte_vhost_get_mem_table(vid, &amp;amp;vdev-&amp;gt;mem) != 0) {
+        
+    }
+
+    /* 为vhost_dev对象分配一个运行核 */
+    vdev-&amp;gt;lcore = spdk_vhost_allocate_reactor(vdev-&amp;gt;cpumask);
+
+    /* 记录该vdev对象内存表中虚拟地址到物理地址的映射关系，后续操作物理DMA时可用 */
+    spdk_vhost_dev_mem_register(vdev);
+
+    /* 向vhost_dev对象的运行核发送一个事件，使该核上的reactor线程可以执行backend的start_device函数 */
+    rc = spdk_vhost_event_send(vdev, vdev-&amp;gt;backend-&amp;gt;start_device, 3, &quot;start device&quot;);
+    ...
+
+    return rc;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  vhost_dev的运行核上的reactor线程会执行backend的start_device，即spdk_vhost_blk_start：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/vhost_blk.c:
+
+static int
+spdk_vhost_blk_start(struct spdk_vhost_dev *vdev, void *event_ctx)
+{
+    struct spdk_vhost_blk_dev *bvdev;
+    int i, rc = 0;
+
+    bvdev = to_blk_dev(vdev);
+    ...
+
+    /* 为vhost设备中的每个队列分配task数组，task与队列中元素个数相同，一一对应 */
+    rc = alloc_task_pool(bvdev);
+    ...
+
+    if (bvdev-&amp;gt;bdev) {
+        /* 为vhost_blk对应申请IO Channel，此时已确定执行线程上下文 */
+        bvdev-&amp;gt;bdev_io_channel = spdk_bdev_get_io_channel(bvdev-&amp;gt;bdev_desc);
+        ...
+    }
+
+    /* 在当前reactor线程中添加一个poller，用来处理IO环中的所有请求 */
+    bvdev-&amp;gt;requestq_poller = spdk_poller_register(bvdev-&amp;gt;bdev ? vdev_worker : no_bdev_vdev_worker, bvdev, 0);
+    ...
+    return rc;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  至此，SPDK中vhost进程的初始化流程已介绍完毕，过程非常漫长，大家可以在对数据面的处理流程有一定的熟悉之后再来阅读分析这部分代码，这样可以理解得更深刻。&lt;/p&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-vhost-msg-handle/&quot;&gt;【SPDK】七、vhost客户端连接请求处理&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Tue, 22 May 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/05/SPDK-vhost-msg-handle/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/05/SPDK-vhost-msg-handle/</guid>
+        
+        <category>SPDK</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【SPDK】六、vhost子系统</title>
+        <description>&lt;p&gt;  vhost子系统在SPDK中属于应用层或叫协议层，为虚拟机提供vhost-blk、vhost-scsi和vhost-nvme三种虚拟设备。这里我们以vhost-blk为分析对象，来讨论vhost子系统基本原理。&lt;/p&gt;
+
+&lt;h3 id=&quot;vhost子系统初始化&quot;&gt;vhost子系统初始化&lt;/h3&gt;
+
+&lt;p&gt;  vhost子系统的描述如下：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/event/subsystems/vhost/vhost.c:
+
+static struct spdk_subsystem g_spdk_subsystem_vhost = {
+    .name = &quot;vhost&quot;,
+    .init = spdk_vhost_subsystem_init,
+    .fini = spdk_vhost_subsystem_fini,
+    .config = NULL,
+    .write_config_json = spdk_vhost_config_json,
+};
+
+static void
+spdk_vhost_subsystem_init(void)
+{
+    int rc = 0;
+
+    rc = spdk_vhost_init();
+
+    spdk_subsystem_init_next(rc);
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+&lt;p&gt;  vhost子系统初始化时，会依次偿试对vhost-scsi、vhost-blk和vhost-nvme进行初始化，如果配置文件中配置了对应类型的设备，那就会完成对应设备的创建并初始化监听socket等待qemu客户端进行连接。&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/vhost.c:
+
+int
+spdk_vhost_init(void)
+{
+    int ret;
+
+    ...
+
+    ret = spdk_vhost_scsi_controller_construct();
+    if (ret != 0) {
+        SPDK_ERRLOG(&quot;Cannot construct vhost controllers\n&quot;);
+        return -1;
+    }
+
+    ret = spdk_vhost_blk_controller_construct();
+    if (ret != 0) {
+        SPDK_ERRLOG(&quot;Cannot construct vhost block controllers\n&quot;);
+        return -1;
+    }
+
+    ret = spdk_vhost_nvme_controller_construct();
+    if (ret != 0) {
+        SPDK_ERRLOG(&quot;Cannot construct vhost NVMe controllers\n&quot;);
+        return -1;
+    }
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h3 id=&quot;vhost-blk初始化&quot;&gt;vhost-blk初始化&lt;/h3&gt;
+
+&lt;p&gt;  vhost-blk初始化时主要完成了两部分工作：一是vhost设备通用部分，即建立监听socket并拉起监听线程等待客户端连接；另一方面是vhost-blk特有的初始化动作，即打开bdev设备并建立联系：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/vhost_blk.c:
+
+int
+spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_name, bool readonly)
+{
+    struct spdk_vhost_blk_dev *bvdev = NULL;
+    struct spdk_bdev *bdev;
+    int ret = 0;
+
+    spdk_vhost_lock();
+
+    /* 首先通过bdev名称查找对应的bdev对象；bdev子系统在vhost子系统之前先完成初始化，正常情况下这里能找到对应的bdev */
+    bdev = spdk_bdev_get_by_name(dev_name);
+    ...
+
+    bvdev = spdk_dma_zmalloc(sizeof(*bvdev), SPDK_CACHE_LINE_SIZE, NULL);
+    ...
+
+    /* 打开对应的bdev，并将句柄记录到bvdev-&amp;gt;bdev_desc中 */
+    ret = spdk_bdev_open(bdev, true, bdev_remove_cb, bvdev, &amp;amp;bvdev-&amp;gt;bdev_desc);
+    ...
+
+    bvdev-&amp;gt;bdev = bdev;
+    bvdev-&amp;gt;readonly = readonly;
+
+    /* 完成vhost设备通用部分功能的初始化，并将该vhost设备的backend操作集合设为vhost_blk_device_backend；
+        说明：不同的vhost类型实现了不同的backend，以完成不同类型特定的一些操作过程。我们在后续分析客户端连接
+        操作时会深入分析backend的实现 */
+    ret = spdk_vhost_dev_register(&amp;amp;bvdev-&amp;gt;vdev, name, cpumask, &amp;amp;vhost_blk_device_backend);
+    ...
+
+    spdk_vhost_unlock();
+    return ret;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  vhost设备初始化主要提供了一个可供客户端(如qemu)连接的socket，并遵循vhost协议实现连接服务，这部分功能也是DPDK中已实现的功能，SPDK直接借用了相关代码：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/vhost.c:
+
+int
+spdk_vhost_dev_register(struct spdk_vhost_dev *vdev, const char *name, const char *mask_str,
+                                            const struct spdk_vhost_dev_backend *backend)
+{
+    char path[PATH_MAX];
+    struct stat file_stat;
+    struct spdk_cpuset *cpumask;
+    int rc;
+
+
+    /* 将配置文件中读取的mask_str转换成位图记录到cpumask中，代表该vhost设备可以绑定的CPU核范围 */
+    cpumask = spdk_cpuset_alloc();
+    ...
+    if (spdk_vhost_parse_core_mask(mask_str, cpumask) != 0) {
+    ...
+    }
+    ...
+
+    /* 生成socket文件路径名，规则是设备路径名(vhost命令启动时-S参数指定)加上vhost对象名称，
+        例如 “/var/tmp/vhost.2” */
+    if (snprintf(path, sizeof(path), &quot;%s%s&quot;, dev_dirname, name) &amp;gt;= (int)sizeof(path)) {
+        ...
+    }
+    ...
+
+    /* 生成socket监听句柄 */
+    if (rte_vhost_driver_register(path, 0) != 0) {
+        ...
+    }
+    if (rte_vhost_driver_set_features(path, backend-&amp;gt;virtio_features) ||
+            rte_vhost_driver_disable_features(path, backend-&amp;gt;disabled_features)) {
+        ...
+    }
+
+    /* 注册socket连接建立后的消息处理notify_op回调 */
+    if (rte_vhost_driver_callback_register(path, &amp;amp;g_spdk_vhost_ops) != 0) {
+        ...
+    }
+
+    /* 拉起一个监听线程，开始等待客户连接请求 */
+    if (spdk_call_unaffinitized(_start_rte_driver, path) == NULL) {
+        ...
+    }
+
+    vdev-&amp;gt;name = strdup(name);
+    vdev-&amp;gt;path = strdup(path);
+    vdev-&amp;gt;id = ctrlr_num++;
+    vdev-&amp;gt;vid = -1; /* 代表客户端连接对象，在客户端连接过程中生成 */
+    vdev-&amp;gt;lcore = -1; /* 代表当前vhost设备绑定到哪个核上运行，也是在客户端连接后请求处理过程中生成 */
+    vdev-&amp;gt;cpumask = cpumask;
+    vdev-&amp;gt;registered = true;
+    vdev-&amp;gt;backend = backend;
+
+    ...
+
+    TAILQ_INSERT_TAIL(&amp;amp;g_spdk_vhost_devices, vdev, tailq);
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  _start_rte_driver会拉起一个监听线程执行fdset_event_dispatch函数，该函数等待客户端的连接请求。当qemu向socket发起连接请求时，监听线程收到该请求并调用vhost_user_server_new_connection建立一个新的连接，然后在新的连接上等待客户端发消息。收到消息时，监听线程会调用vhost_user_read_cb函数处理消息。消息的处理代表了vhost协议的基本原理，我们将在后续独立的博文介绍。&lt;/p&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-subsys-vhost/&quot;&gt;【SPDK】六、vhost子系统&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Tue, 22 May 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/05/SPDK-subsys-vhost/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/05/SPDK-subsys-vhost/</guid>
+        
+        <category>SPDK</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【SPDK】五、bdev子系统</title>
+        <description>&lt;p&gt;  SPDK从功能角度将各个独立的部分划分为“&lt;strong&gt;子系统&lt;/strong&gt;“。例如对各种后端存储的访问属于bdev子系统，又例如对虚拟机呈现各种设备属于vhost子系统。不同场景下，各种工具可以通过组合不同的子系统来实现各种不同的功能。例如虚拟化场景下，vhost主要集成了bdev、vhost、scsi等子系统。这些子系统存在一定依赖关系，例如vhost子系统依赖bdev，这就需要将被依赖的子系统先初始化完成，才能执行其它子系统的初始化。&lt;/p&gt;
+
+&lt;p&gt;  本篇博文我们先整体介绍一下SPDK子系统的初始化流程，然后再深入分析一下bdev子系统。vhost子系统我们将在独立的博文中展开分析。&lt;/p&gt;
+
+&lt;h3 id=&quot;spdk子系统&quot;&gt;SPDK子系统&lt;/h3&gt;
+
+&lt;p&gt;  通过前文的分析，我们知道主线程在执行_spdk_reactor_run时，首先处理的事件便是verify事件，该事件处理函数为spdk_subsystem_verify：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/event/subsystem.c:
+
+static void
+spdk_subsystem_verify(void *arg1, void *arg2)
+{
+    struct spdk_subsystem_depend *dep;
+
+    /* 检查当前应用中所有需要的子系统及其依赖系统是否均已成功注册 */
+    /* Verify that all dependency name and depends_on subsystems are registered */
+    TAILQ_FOREACH(dep, &amp;amp;g_subsystems_deps, tailq) {
+        if (!spdk_subsystem_find(&amp;amp;g_subsystems, dep-&amp;gt;name)) {
+            SPDK_ERRLOG(&quot;subsystem %s is missing\n&quot;, dep-&amp;gt;name);
+            spdk_app_stop(-1);
+            return;
+        }
+        if (!spdk_subsystem_find(&amp;amp;g_subsystems, dep-&amp;gt;depends_on)) {
+            SPDK_ERRLOG(&quot;subsystem %s dependency %s is missing\n&quot;,
+                dep-&amp;gt;name, dep-&amp;gt;depends_on);
+            spdk_app_stop(-1);
+            return;
+        }
+    }
+
+    /* 按依赖关系对所有子系统进行排序 */
+    subsystem_sort();
+
+    /* 依据排序依次执行各个子系统的init函数 */
+    spdk_subsystem_init_next(0);
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h3 id=&quot;bdev子系统&quot;&gt;bdev子系统&lt;/h3&gt;
+
+&lt;p&gt;  bdev和vhost是虚拟化场景下两个最为主要的子系统，且vhost依赖bdev，因此我们先来分析一下bdev子系统。&lt;/p&gt;
+
+&lt;p&gt;  我们可以看到bdev子系统的初始化函数为spdk_bdev_subsystem_initialize：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/event/subsystems/bdev/bdev.c:
+
+static struct spdk_subsystem g_spdk_subsystem_bdev = {
+    .name = &quot;bdev&quot;,
+    .init = spdk_bdev_subsystem_initialize,
+    .fini = spdk_bdev_subsystem_finish,
+    .config = spdk_bdev_config_text,
+    .write_config_json = _spdk_bdev_subsystem_config_json,
+};
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  bdev子系统针对不同的后端存储设备实现了不同的“&lt;strong&gt;模块&lt;/strong&gt;”，例如nvme模块主要实现了用户态对nvme设备的访问操作，virtio实现了用户态对virtio设备的访问操作，又例如malloc模块通过内存实现了一个模拟的块设备。因此bdev子系统在初始化时主要针对配置文件中已经配置的后端存储模块进行初始化操作。&lt;/p&gt;
+
+&lt;p&gt;  另外，bdev借助IO Channel的概念也实现了系统级的management_channel和模块级的module_channel。我们知道IO Channel是一个线程相关的概念，management_channel和module_channel也是如此：&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;
+    &lt;p&gt;management_channel是线程唯一的一个对象，不同线程具备不同的的management_channel，同一个线程只有一个。目前management_channel中实现了一个线程内部独立的内存池，用来缓存bdev_io对象；&lt;/p&gt;
+  &lt;/li&gt;
+  &lt;li&gt;
+    &lt;p&gt;module_channel是线程内部属于同一个模块的bdev所共享的一个对象，用来记录同一线程中属于同一模块的所有对象。例如同一个线程如果操作两个nvme的bdev对象且这两个bdev属于不同的nvme控制器，那么虽然这两个bdev对应不同的NVMe IO Channel，但是它们属于同一个module_channel。目前module_channel只含有一个模块级的引用计数和内存不足时的bdev io临时队列(当有内存空间时，实现IO重发)。&lt;/p&gt;
+  &lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;  每个模块都会提供一个module_init函数，当bdev子系统初始化时会依次调用这些初始化函数。下面我们以NVMe和virtio两个模块为例，来简要看下模块的初始化逻辑。&lt;/p&gt;
+
+&lt;h4 id=&quot;1-nvme模块初始化&quot;&gt;&lt;strong&gt;1. nvme模块初始化&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  nvme模块描述如下：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/bdev/nvme/bdev_nvme.c:
+
+static struct spdk_bdev_module nvme_if = {
+    .name = &quot;nvme&quot;,
+    .module_init = bdev_nvme_library_init,
+    .module_fini = bdev_nvme_library_fini,
+    .config_text = bdev_nvme_get_spdk_running_config,
+    .config_json = bdev_nvme_config_json,
+    .get_ctx_size = bdev_nvme_get_ctx_size,
+
+    };
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  这里我们可以看到nvme模块的初始化函数为bdev_nvme_library_init，另外bdev_nvme_get_ctx_size返回的context大小为nvme_bdev_io的大小。bdev子系统会以所有模块最大的context大小来创建bdev_io内存池，以此确保为所有模块申请bdev_io时都能获得足够的扩展内存(nvme_bdev_io即是对bdev_io的扩展)。&lt;/p&gt;
+
+&lt;p&gt;  bdev_nvme_library_init函数从SPDK的配置文件中读取“Nvme”字段开始的相关信息，并通过这些信息创建一个NVMe控制器并获取其下的namespace，最后将namespace表示成一个bdev对象。这里我们打开看一下识别到对应NVMe控制器后的回调处理逻辑：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;
+static void
+attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+            struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+{
+    struct nvme_ctrlr *nvme_ctrlr;
+    struct nvme_probe_ctx *ctx = cb_ctx;
+    char *name = NULL;
+    size_t i;
+
+    /* 首先根据DPDK中PCI驱动框架识别到的NVMe控制器信息来创建一个nvme_ctrlr对象 */
+    if (ctx) {
+        for (i = 0; i &amp;lt; ctx-&amp;gt;count; i++) {
+            if (spdk_nvme_transport_id_compare(trid, &amp;amp;ctx-&amp;gt;trids[i]) == 0) {
+                name = strdup(ctx-&amp;gt;names[i]);
+                break;
+            }
+        }
+    } else {
+        name = spdk_sprintf_alloc(&quot;HotInNvme%d&quot;, g_hot_insert_nvme_controller_index++);
+    }
+
+    nvme_ctrlr = calloc(1, sizeof(*nvme_ctrlr));
+    ...
+    nvme_ctrlr-&amp;gt;adminq_timer_poller = NULL;
+    nvme_ctrlr-&amp;gt;ctrlr = ctrlr;
+    nvme_ctrlr-&amp;gt;ref = 0;
+    nvme_ctrlr-&amp;gt;trid = *trid;
+    nvme_ctrlr-&amp;gt;name = name;
+
+    /* 将该nvme控制器对象添加为一个io device；每个io device可申请独立的IO Channel；
+        bdev_nvme_create_cb负责在IO Channel对象创建时初始化底层驱动相关对象，这里
+        即是获取一个新的queue pair */
+    spdk_io_device_register(ctrlr, bdev_nvme_create_cb, bdev_nvme_destroy_cb,
+                                                sizeof(struct nvme_io_channel));
+
+    /* 此处开始枚举nvme控制器下的所有namespace，并将其建为bdev对象。注意一点，此时并不会为
+        bdev申请IO channel，它是vhost子系统初始时，完成线程绑定后才创建的 */
+    if (nvme_ctrlr_create_bdevs(nvme_ctrlr) != 0) {
+        ...
+    }
+
+    nvme_ctrlr-&amp;gt;adminq_timer_poller = spdk_poller_register(bdev_nvme_poll_adminq, ctrlr,
+                                                    g_nvme_adminq_poll_timeout_us);
+
+    TAILQ_INSERT_TAIL(&amp;amp;g_nvme_ctrlrs, nvme_ctrlr, tailq);
+
+    ...
+}
+
+/* 注意：bdev初始化时并不调用该函数 */
+static int
+bdev_nvme_create_cb(void *io_device, void *ctx_buf)
+{
+    struct spdk_nvme_ctrlr *ctrlr = io_device;
+    struct nvme_io_channel *ch = ctx_buf;
+
+    /* 分配一个nvme queue pair作为该IO Channel的实际对象 */
+    ch-&amp;gt;qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, NULL, 0);
+    ...
+    /* 向reactor注册一个poller，轮循新分配queue pair中已完成的响应信息 */
+    ch-&amp;gt;poller = spdk_poller_register(bdev_nvme_poll, ch, 0);
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  类似地，我们再看一下virtio模块的初始化。&lt;/p&gt;
+
+&lt;h4 id=&quot;2-virtio模块初始化&quot;&gt;&lt;strong&gt;2. virtio模块初始化&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  virtio虽说起源于qemu-kvm虚拟化，但是它也是一种可用物理硬件实现的协议规范。因此SPDK也把它当做一种后端存储类型加以实现。当然，如果SPDK的vhost进程是运行在虚拟机中(而虚拟机virtio设备作为后端存储)，virtio模块就是一个必不可少的驱动模块了。&lt;/p&gt;
+
+&lt;p&gt;  我们以virtio-blk设备为例，来看一下其初始化过程：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/bdev/virtio/bdev_virtio_blk.c:
+
+static struct spdk_bdev_module virtio_blk_if = {
+    .name = &quot;virtio_blk&quot;,
+    .module_init = bdev_virtio_initialize,
+    .get_ctx_size = bdev_virtio_blk_get_ctx_size,
+};
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+&lt;p&gt;  bdev_virtio_initialize通过配置文件获取相关配置信息，并同样借助DPDK的用户态PCI设备管理框架识别到该设备后，调用virtio_pci_blk_dev_create来创建一个virtio_blk对象：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/bdev/virtio/bdev_virtio_blk.c:
+
+static struct virtio_blk_dev *
+virtio_pci_blk_dev_create(const char *name, struct virtio_pci_ctx *pci_ctx)
+{
+    static int pci_dev_counter = 0;
+    struct virtio_blk_dev *bvdev;
+    struct virtio_dev *vdev;
+    char *default_name = NULL;
+    uint16_t num_queues;
+    int rc;
+
+    /* 分配一个virtio_blk_dev对象 */
+    bvdev = calloc(1, sizeof(*bvdev));
+    ...
+    vdev = &amp;amp;bvdev-&amp;gt;vdev;
+
+    /* 为该virtio对象绑定用户态操作接口，注，该操作接口实现了virtio 1.0规范 */
+    rc = virtio_pci_dev_init(vdev, name, pci_ctx);
+    ...
+
+    /* 重置设备状态 */
+    rc = virtio_dev_reset(vdev, VIRTIO_BLK_DEV_SUPPORTED_FEATURES);
+    ...
+
+    /* 获取设备支持的最大队列数。如果支持多队列，从设备的配置寄存器中聊取；否则为1 */
+    /* TODO: add a way to limit usable virtqueues */
+    if (virtio_dev_has_feature(vdev, VIRTIO_BLK_F_MQ)) {
+        virtio_dev_read_dev_config(vdev, offsetof(struct virtio_blk_config, num_queues),
+            &amp;amp;num_queues, sizeof(num_queues));
+    } else {
+        num_queues = 1;
+    }
+
+    /* 初始化队列并创建bdev对象 */
+    rc = virtio_blk_dev_init(bvdev, num_queues);
+    ...
+
+    return bvdev;
+}
+
+static int
+virtio_blk_dev_init(struct virtio_blk_dev *bvdev, uint16_t max_queues)
+{
+    struct virtio_dev *vdev = &amp;amp;bvdev-&amp;gt;vdev;
+    struct spdk_bdev *bdev = &amp;amp;bvdev-&amp;gt;bdev;
+    uint64_t capacity, num_blocks;
+    uint32_t block_size;
+    uint16_t host_max_queues;
+    int rc;
+
+    /* 获取当前设备的块大小，默认为512字节 */
+    if (virtio_dev_has_feature(vdev, VIRTIO_BLK_F_BLK_SIZE)) {
+        virtio_dev_read_dev_config(vdev, offsetof(struct virtio_blk_config, blk_size),
+            &amp;amp;block_size, sizeof(block_size));
+    } else {
+        block_size = 512;
+    }
+
+    /* 获取设备容量 */
+    virtio_dev_read_dev_config(vdev, offsetof(struct virtio_blk_config, capacity),
+        &amp;amp;capacity, sizeof(capacity));
+
+    /* `capacity` is a number of 512-byte sectors. */
+    num_blocks = capacity * 512 / block_size;
+
+    /* 获取最大队列数 */
+    if (virtio_dev_has_feature(vdev, VIRTIO_BLK_F_MQ)) {
+            virtio_dev_read_dev_config(vdev, offsetof(struct virtio_blk_config, num_queues),
+        &amp;amp;host_max_queues, sizeof(host_max_queues));
+    } else {
+        host_max_queues = 1;
+    }
+
+    if (virtio_dev_has_feature(vdev, VIRTIO_BLK_F_RO)) {
+        bvdev-&amp;gt;readonly = true;
+    }
+
+    /* bdev is tied with the virtio device; we can reuse the name */
+    bdev-&amp;gt;name = vdev-&amp;gt;name;
+
+    /* 按max_queues分配队列，并启动设备 */
+    rc = virtio_dev_start(vdev, max_queues, 0);
+    ...
+
+    /* 为bdev对象赋值 */
+    bdev-&amp;gt;product_name = &quot;VirtioBlk Disk&quot;;
+    bdev-&amp;gt;write_cache = 0;
+    bdev-&amp;gt;blocklen = block_size;
+    bdev-&amp;gt;blockcnt = num_blocks;
+
+    bdev-&amp;gt;ctxt = bvdev;
+    bdev-&amp;gt;fn_table = &amp;amp;virtio_fn_table;
+    bdev-&amp;gt;module = &amp;amp;virtio_blk_if;
+
+    /* 将virtio_blk_dev添加为一个io device；其IO Channel创建回调bdev_virtio_blk_ch_create_cb会申请一个
+        virtio的IO环作为该IO Channel的实际对象 */
+    spdk_io_device_register(bvdev, bdev_virtio_blk_ch_create_cb,
+            bdev_virtio_blk_ch_destroy_cb,
+            sizeof(struct bdev_virtio_blk_io_channel));
+
+    /* 注册该bdev对象，便于后续查找 */
+    rc = spdk_bdev_register(bdev);
+    ...
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-subsys-bdev/&quot;&gt;【SPDK】五、bdev子系统&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Mon, 21 May 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/05/SPDK-subsys-bdev/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/05/SPDK-subsys-bdev/</guid>
+        
+        <category>SPDK</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【SPDK】四、reactor线程</title>
+        <description>&lt;p&gt;  reactor线程是SPDK中负责实际业务处理逻辑的单元，它们在vhsot服务启动时创建，直到服务停止。目前还不支持reactor线程的动态增减。&lt;/p&gt;
+
+&lt;h3 id=&quot;reactor线程总流程&quot;&gt;reactor线程总流程&lt;/h3&gt;
+
+&lt;p&gt;  我们顺着vhost进程的代码执行顺序来看看总体流程：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/app/vhost/vhost.c:
+
+int
+main(int argc, char *argv[])
+{
+    struct spdk_app_opts opts = {};
+    int rc;
+
+    /* 首先进行参数解析，解析后的结果保存于opts中 */
+
+    vhost_app_opts_init(&amp;amp;opts);
+
+    if ((rc = spdk_app_parse_args(argc, argv, &amp;amp;opts, &quot;f:S:&quot;,
+        vhost_parse_arg, vhost_usage)) !=
+        SPDK_APP_PARSE_ARGS_SUCCESS) {
+        exit(rc);
+    }
+
+    ...
+
+    /* 接着根据配置文件指明的物理核启动reactors线程(主线程最终也成为一个reactor)。
+        这些reactors线程会执行轮循函数，直到外部将服务状态置为退出 */
+
+    /* Blocks until the application is exiting */
+    rc = spdk_app_start(&amp;amp;opts, vhost_started, NULL, NULL);
+
+    /* 所有reactor线程退出后，进行资源清理 */
+    spdk_app_fini();
+
+    return rc;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  上述整体流程中最为重要的便是spdk_app_start函数，该函数内部调用了DPDK关于系统CPU、内存、PCI设备管理等通用性服务代码，这里我们尽可能以理解其功能为主而不做深入的代码分析：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/event/app.c:
+
+int
+spdk_app_start(struct spdk_app_opts *opts, spdk_event_fn start_fn,
+void *arg1, void *arg2)
+{
+    struct spdk_conf	*config = NULL;
+    int			rc;
+    struct spdk_event	*app_start_event;
+
+    ...
+
+    /* 将配置文件中的内容导入到config对象中 */
+    config = spdk_app_setup_conf(opts-&amp;gt;config_file);
+    ...
+    spdk_app_read_config_file_global_params(opts);
+
+    ...
+
+    /* 调用DPDK系统服务：
+        (1)通过内核sysfs获取物理CPU信息，并通过配置文件指定的运行核，在各个核上启动服务线程；
+        各服务线程启动后因为在等待主线程给它们发送需要执行的任务而处于睡眠状态；
+        (2)基于大页内存创建内存池以供其它模块使用；
+        (3)初始化PCI设备枚举服务，可以实现类似内核的设备发现及驱动初始化流程。SPDK基于此并借
+        助内核uio或vfio驱动实现全用户态的PCI驱动 */
+     /* 完成DPDK的初始化后，SPDK会建立一张由vva(vhost virtual address)到pa(physical address)
+        的内存映射表g_vtophys_map。每当有新的内存映射到vhost中时，都需要调用spdk_mem_register在该
+        表中注册新的映射关系。设计该表的原因是当SPDK向物理设备发送DMA请求时，需要向设备提供pa而非vva */
+    if (spdk_app_setup_env(opts) &amp;lt; 0) {
+        ...
+    }
+
+    /* 这里为reactors分配相应的内存 */
+    /*
+     * If mask not specified on command line or in configuration file,
+     *  reactor_mask will be 0x1 which will enable core 0 to run one
+     *  reactor.
+     */
+    if ((rc = spdk_reactors_init(opts-&amp;gt;max_delay_us)) != 0) {
+        ...
+    }
+
+    ...
+
+    /* 设置一些全局变量 */
+    memset(&amp;amp;g_spdk_app, 0, sizeof(g_spdk_app));
+    g_spdk_app.config = config;
+    g_spdk_app.shm_id = opts-&amp;gt;shm_id;
+    g_spdk_app.shutdown_cb = opts-&amp;gt;shutdown_cb;
+    g_spdk_app.rc = 0;
+    g_init_lcore = spdk_env_get_current_core();
+    g_app_start_fn = start_fn;
+    g_app_start_arg1 = arg1;
+    g_app_start_arg2 = arg2;
+    app_start_event = spdk_event_allocate(g_init_lcore, start_rpc, (void *)opts-&amp;gt;rpc_addr, NULL);
+
+    /* 初始化SPDK的各个子系统，如bdev、vhost均为子系统。但这里需注意一点，此处仅是产生了一个初始化事件，事件的处理要在
+        reactor线程正式进入轮循函数后才开始 */
+    spdk_subsystem_init(app_start_event);
+
+    /* 从此处开始，各个线程(包括主线程)开始执行_spdk_reactor_run，线程名也正式变更为reactor_X；
+        直到所有线程均退出_spdk_reactor_run后，主线程才会返回 */
+    /* This blocks until spdk_app_stop is called */
+    spdk_reactors_start();
+
+    return g_spdk_app.rc;
+    ...    
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  再看一下spdk_reactors_start：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/event/reactor.c:
+
+void
+spdk_reactors_start(void)
+{
+    struct spdk_reactor *reactor;
+    uint32_t i, current_core;
+    int rc;
+
+    g_reactor_state = SPDK_REACTOR_STATE_RUNNING;
+    g_spdk_app_core_mask = spdk_cpuset_alloc();
+
+    /* 针对主线程之外的其它核上的线程，通过发送通知使它们开始执行_spdk_reactor_run */
+    current_core = spdk_env_get_current_core();
+    SPDK_ENV_FOREACH_CORE(i) {
+        if (i != current_core) {
+            reactor = spdk_reactor_get(i);
+            rc = spdk_env_thread_launch_pinned(reactor-&amp;gt;lcore, _spdk_reactor_run, reactor);
+            ...
+        }
+        spdk_cpuset_set_cpu(g_spdk_app_core_mask, i, true);
+    }
+
+    /* 主线程也会执行_spdk_reactor_run */
+    /* Start the master reactor */
+    reactor = spdk_reactor_get(current_core);
+    _spdk_reactor_run(reactor);
+
+    /* 主线程退出后会等待其它核上的线程均退出 */
+    spdk_env_thread_wait_all();
+
+    /* 执行到此处，说明vhost服务进程即将退出 */
+    g_reactor_state = SPDK_REACTOR_STATE_SHUTDOWN;
+    spdk_cpuset_free(g_spdk_app_core_mask);
+    g_spdk_app_core_mask = NULL;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h3 id=&quot;轮循函数_spdk_reactor_run&quot;&gt;轮循函数_spdk_reactor_run&lt;/h3&gt;
+
+&lt;p&gt;  通过对vhost代码流程的分析，我们看到vhost中所有线程最终都会调用_spdk_reactor_run，该函数是一个死循环，由此实现轮循逻辑：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/event/reactor.c:
+
+static int
+_spdk_reactor_run(void *arg)
+{
+    struct spdk_reactor	*reactor = arg;
+    struct spdk_poller	*poller;
+    uint32_t		event_count;
+    uint64_t		idle_started, now;
+    uint64_t		spin_cycles, sleep_cycles;
+    uint32_t		sleep_us;
+    uint32_t		timer_poll_count;
+    char			thread_name[32];
+
+    /* 重新命名线程名，reactor_[核号] */
+    snprintf(thread_name, sizeof(thread_name), &quot;reactor_%u&quot;, reactor-&amp;gt;lcore);
+
+    /* 创建SPDK线程对象：
+        (1)线程间通过_spdk_reactor_send_msg发送消息，本质是向接收方的event队列中添加事件；
+        (2)线程通过_spdk_reactor_start_poller和_spdk_reactor_stop_poller启动和停止poller；
+        (3)IO Channel等线程相关对象也会记录到线程对象中 */
+    if (spdk_allocate_thread(_spdk_reactor_send_msg,
+            _spdk_reactor_start_poller,
+            _spdk_reactor_stop_poller,
+            reactor, thread_name) == NULL) {
+        return -1;
+    }
+    
+    /* spin_cycles代表最短轮循时间 */
+    spin_cycles = SPDK_REACTOR_SPIN_TIME_USEC * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+    /* sleep_cycles代表最长睡眠时间 */
+    sleep_cycles = reactor-&amp;gt;max_delay_us * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
+    idle_started = 0;
+    timer_poll_count = 0;
+
+    /* 轮循的死循环正式开始 */
+    while (1) {
+        bool took_action = false;
+
+        /* 首先，每个reactor线程通过DPDK的无锁队列实现了一个事件队列；这里从事件队列中取出事件并调用事件
+            的处理函数。例如，vhost的子系统的初始化即是在spdk_subsystem_init中产生了一个verify事件并
+            添加到主线程reactor的事件队列中，该事件处理函数为spdk_subsystem_verify */
+        event_count = _spdk_event_queue_run_batch(reactor);
+        if (event_count &amp;gt; 0) {
+            took_action = true;
+        }
+
+        /* 接着，每个reactor线程从active_pollers链表头部取出一个poller并调用其fn函数。poller代表一次
+            具体的处理动作，例如处理某个vhost_blk设备的所有IO环中的请求，又或者处理后端NVMe某个queue 
+            pair中的所有响应 */
+        poller = TAILQ_FIRST(&amp;amp;reactor-&amp;gt;active_pollers);
+        if (poller) {
+            TAILQ_REMOVE(&amp;amp;reactor-&amp;gt;active_pollers, poller, tailq);
+            poller-&amp;gt;state = SPDK_POLLER_STATE_RUNNING;
+            poller-&amp;gt;fn(poller-&amp;gt;arg);
+            if (poller-&amp;gt;state == SPDK_POLLER_STATE_UNREGISTERED) {
+                free(poller);
+            } else {
+                poller-&amp;gt;state = SPDK_POLLER_STATE_WAITING;
+                TAILQ_INSERT_TAIL(&amp;amp;reactor-&amp;gt;active_pollers, poller, tailq);
+            }
+            took_action = true;
+        }
+
+        /* 最后，reactor线程还实现了定时器逻辑，这里判断是否有定时器到期；如果确有定时器到期则执行其回调并将
+            其放到定时器队列尾部 */
+        if (timer_poll_count &amp;gt;= SPDK_TIMER_POLL_ITERATIONS) {
+            poller = TAILQ_FIRST(&amp;amp;reactor-&amp;gt;timer_pollers);
+            if (poller) {
+                now = spdk_get_ticks();
+
+                if (now &amp;gt;= poller-&amp;gt;next_run_tick) {
+                    TAILQ_REMOVE(&amp;amp;reactor-&amp;gt;timer_pollers, poller, tailq);
+                    poller-&amp;gt;state = SPDK_POLLER_STATE_RUNNING;
+                    poller-&amp;gt;fn(poller-&amp;gt;arg);
+                    if (poller-&amp;gt;state == SPDK_POLLER_STATE_UNREGISTERED) {
+                        free(poller);
+                    } else {
+                        poller-&amp;gt;state = SPDK_POLLER_STATE_WAITING;
+                        _spdk_poller_insert_timer(reactor, poller, now);
+                    }
+                    took_action = true;
+                }
+            }
+            timer_poll_count = 0;
+        } else {
+            timer_poll_count++;
+        }
+
+        /* 下面的逻辑主要用来决定轮循线程是否可以睡眠一会 */
+
+        if (took_action) {
+            /* We were busy this loop iteration. Reset the idle timer. */
+            idle_started = 0;
+        } else if (idle_started == 0) {
+            /* We were previously busy, but this loop we took no actions. */
+            idle_started = spdk_get_ticks();
+        }
+
+        /* Determine if the thread can sleep */
+        if (sleep_cycles &amp;amp;&amp;amp; idle_started) {
+            now = spdk_get_ticks();
+            if (now &amp;gt;= (idle_started + spin_cycles)) { /* 保证轮循线程最少已执行了spin_cycles */
+                sleep_us = reactor-&amp;gt;max_delay_us;
+
+                poller = TAILQ_FIRST(&amp;amp;reactor-&amp;gt;timer_pollers);
+                if (poller) {
+                    /* There are timers registered, so don't sleep beyond
+                     * when the next timer should fire */
+                    if (poller-&amp;gt;next_run_tick &amp;lt; (now + sleep_cycles)) {
+                        if (poller-&amp;gt;next_run_tick &amp;lt;= now) {
+                            sleep_us = 0;
+                        } else {
+                            sleep_us = ((poller-&amp;gt;next_run_tick - now) *
+                                SPDK_SEC_TO_USEC) / spdk_get_ticks_hz();
+                        }
+                    }
+                }
+
+                if (sleep_us &amp;gt; 0) {
+                    usleep(sleep_us);
+                }
+
+                /* After sleeping, always poll for timers */
+                timer_poll_count = SPDK_TIMER_POLL_ITERATIONS;
+            }
+        }
+
+        if (g_reactor_state != SPDK_REACTOR_STATE_RUNNING) {
+            break;
+        }
+    } /* 死循环结束 */
+
+    ...
+    spdk_free_thread();
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  至此，reactor线程整体执行逻辑已分析完成，后续我们将以verify_event为线索开始分析各个子系统的初始化过程。&lt;/p&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-reactors-init/&quot;&gt;【SPDK】四、reactor线程&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Mon, 21 May 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/05/SPDK-reactors-init/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/05/SPDK-reactors-init/</guid>
+        
+        <category>SPDK</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【SPDK】三、IO流程代码解析</title>
+        <description>&lt;p&gt;  在分析SPDK数据面代码之前，需要我们对qemu中实现的IO环以及virtio前后端驱动的实现有所了解(后续我计划出专门的博文来介绍qemu)。这里我们仍以SPDK前端配置vhost-blk，后端对接NVMe SSD为例(有关NVMe驱动涉及较多规范细节，这里也不作过于深入的讨论，感兴趣的读者可以结合NVMe规范展开阅读)进行分析。&lt;/p&gt;
+
+&lt;h3 id=&quot;总流程&quot;&gt;总流程&lt;/h3&gt;
+
+&lt;p&gt;  前文在分析SPDK IO栈时已经大致分析了IO处理的调用层次，在此我们进一步打开内部实现细节，更细致地分析一下IO处理流程：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/spdk/ioanalyze.jpg&quot; height=&quot;600&quot; width=&quot;750&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  首先，从虚拟机视角来说，它看到的是一个virtio-blk-pci设备，该pci设备内部包含一条virtio总线，其上又连接了virtio-blk设备。qemu在对虚拟机用户呈现这个virtio-blk-pci设备时，采用的具体设备类型是vhost-user-blk-pci(这是virtio-blk-pci设备的一种后端实现方式。另外两种是：vhost-blk-pci，由内核实现后端；普通virtio-blk-pci，由qemu实现后端处理)，这样便可与用户态的SPDK vhost进程建立连接。SPDK vhost进程内部对于虚拟机所见的virtio-blk-pci设备也有一个对象来表示它，这就是spdk_vhost_blk_dev。该对象指向一个bdev对象和一个io channel对象，bdev对象代表真正的后端块存储(这里对应NVMe SSD上的一个namespace)，io channel代表当前线程访问存储的独立通道(对应NVMe SSD的一个Queue Pair)。这两个对象在驱动层会进一步扩展新的成员变量，用来表示驱动层可见的一些详细信息。&lt;/p&gt;
+
+&lt;p&gt;  其次，当虚拟机往IO环中放入IO请求后，便立刻被vhost进程中的某个reactor线程轮循到该请求(轮循过种中执行函数为vdev_worker)。reactor线程取出请求后，会将其映成一个任务(spdk_vhost_blk_task)。对于读写请求，会进一步走到bdev层，将任务封状成一个bdev_io对象(类似内核的bio)。bdev_io继续往驱动层递交，它会扩展为适配具体驱动的io对象，例如针对NVMe驱动，bdev_io将扩展成nvme_bdev_io对象。NVMe驱动会根据nvme_bdev_io对象中的请求内容在当前reactor线程对应的QueuePair中生成一个新的请求项，并通知NVMe控制器有新的请求产生。&lt;/p&gt;
+
+&lt;p&gt;  最后，当物理NVMe控制器完成IO请求后，会往QueuePair中添加IO响应。该响应信息也会很快被reactor线程轮循到(轮循执行函数为bdev_nvme_poll)。reactor取出响应后，根据其id找到对应的nvme_bdev_io，进一步关联到对应的bdev_io，再调用bdev_io中的记录的回调函数。vhost-blk下发请求时注册的回调函数为blk_request_complete_cb，回调参数为当前的spdk_vhost_blk_task对象。在blk_request_complete_cb中会往虚拟机IO环中放入IO响应，并通过虚拟中断通知虚拟机IO完成。&lt;/p&gt;
+
+&lt;h3 id=&quot;io请求下发流程代码解析&quot;&gt;IO请求下发流程代码解析&lt;/h3&gt;
+
+&lt;p&gt;  vhost进程通过vdev_worker函数以轮循方式处理虚拟机下发的IO请求，调用栈如下：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;vdev_worker()
+    \-process_vq()
+        |-spdk_vhost_vq_avail_ring_get()
+        \-process_blk_request()
+            |-blk_iovs_setup()
+            \-spdk_bdev_readv()/spdk_bdev_writev()
+                \-spdk_bdev_io_submit()
+                    \-bdev-&amp;gt;fn_table-&amp;gt;submit_request()
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  下面我们先来分析一下vhost-blk层的具体代码实现：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/vhost-blk.c:
+
+/* reactor线程会采用轮循方式周期性地调用vdev_worker函数来处理虚拟机下发的请求 */
+static int
+vdev_worker(void *arg)
+{
+    /* arg在注册轮循函数时指定，代表当前操作的vhost-blk对象 */
+    struct spdk_vhost_blk_dev *bvdev = arg; 
+    uint16_t q_idx;
+
+    /* vhost-blk对象bvdev中含有一个抽象的spdk_vhost_dev对象，其内部记录所有vhost_dev类别对象
+        均含有的公共内容，max_queues代表当前vhost_dev对象共有多少个IO环，virtqueue[]数组记录了
+        所有的IO环信息 */
+    for (q_idx = 0; q_idx &amp;lt; bvdev-&amp;gt;vdev.max_queues; q_idx++) {
+        /* 根据IO环的个数，依次处理每个环中的请求 */
+        process_vq(bvdev, &amp;amp;bvdev-&amp;gt;vdev.virtqueue[q_idx]);
+    }
+
+    ...
+
+}
+
+/* 处理IO环中的所有请求 */
+static void
+process_vq(struct spdk_vhost_blk_dev *bvdev, struct spdk_vhost_virtqueue *vq)
+{
+    struct spdk_vhost_blk_task *task;
+    int rc;
+    uint16_t reqs[32];
+    uint16_t reqs_cnt, i;
+
+    /* 先给出一些关于IO环的知识：
+            (1) 简单来说，每个IO环分成descriptor数组、avail数组和used数组三个部分，数组元素个数均为环的最大请求个数。
+            (2) descriptor数组元素代表一段虚拟机内存，每个IO请求至少包含三段，请求头部段、数据段(至少一个)和响应段。
+                请求头部包含请求类型(读或写)、访问偏移，数据段代表实际的数据存放位置，响应段记录请求处理结果。一般来说，
+                每个IO请求在descriptor中至少要占据三个元素；不过当配置了indirect特性后，一个IO请求只占用一项，只不过
+                该项指向的内存段又是一个descriptor数组，该数组元素个数为IO请求实际所需内存段。
+            (3) avail数组用来记录已下发的IO请求，数组元素内容为IO请求在descriptor数组中的下标，该下标可作为请求的id。
+            (4) used数组用来记录已完成的IO响应，数组元素内容同样为IO在descritpror数组中的下标。
+    */
+
+    /* 从IO环的avail数组中中取出一批请求，将请求id放入reqs数组中；每次将环取空或者最多取32个请求 */
+    reqs_cnt = spdk_vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
+    ...
+
+    /* 依次对reqs数组中的请求进行处理 */
+    for (i = 0; i &amp;lt; reqs_cnt; i++) {
+        ...
+        
+        /* 以请求id作为下标，找到对应的task对象。注，初始化时，会按IO环的最大请求个数来申请tasks数组 */
+        task = &amp;amp;((struct spdk_vhost_blk_task *)vq-&amp;gt;tasks)[reqs[i]];
+        ...
+
+        bvdev-&amp;gt;vdev.task_cnt++; /* 作统计计数 */
+
+        task-&amp;gt;used = true; /* 代表tasks数组中该项正在被使用 */
+        task-&amp;gt;iovcnt = SPDK_COUNTOF(task-&amp;gt;iovs); /* iovs数组将来会记录IO请求中数据段的内存映射信息 */
+        task-&amp;gt;status = NULL; /* 将来指向IO响应段，用来给虚拟机返回IO处理结果 */
+        task-&amp;gt;used_len = 0;
+
+        /* 将IO环中请求的详细信息记录到task中，并递交给bdev层处理 */
+        rc = process_blk_request(task, bvdev, vq);
+        ...
+    }
+}
+
+static int
+process_blk_request(struct spdk_vhost_blk_task *task, struct spdk_vhost_blk_dev *bvdev,
+struct spdk_vhost_virtqueue *vq)
+{
+    const struct virtio_blk_outhdr *req;
+    struct iovec *iov;
+    uint32_t type;
+    uint32_t payload_len;
+    int rc;
+
+    /* 将IO环descriptor数组中记录的请求内存段(以gpa表示，即Guest Physical Address)映成vhost进程中的
+        虚拟地址(vva, vhost virtual address)，并保存到task的iovs数组中 */
+    if (blk_iovs_setup(&amp;amp;bvdev-&amp;gt;vdev, vq, task-&amp;gt;req_idx, task-&amp;gt;iovs, &amp;amp;task-&amp;gt;iovcnt, &amp;amp;payload_len)) {
+        ...
+    }
+
+    /* 第一个请求内存段为请求头部，即struct virtio_blk_outhdr，记录请求类型、访问位置信息 */
+    iov = &amp;amp;task-&amp;gt;iovs[0];
+    ...
+    req = iov-&amp;gt;iov_base;
+
+    /* 最后一个请求内存段用来保存请求处理结果 */
+    iov = &amp;amp;task-&amp;gt;iovs[task-&amp;gt;iovcnt - 1];
+    ...
+    task-&amp;gt;status = iov-&amp;gt;iov_base;
+
+    /* 除去一头一尾，中间的请求内存段为数据段 */
+    payload_len -= sizeof(*req) + sizeof(*task-&amp;gt;status);
+    task-&amp;gt;iovcnt -= 2;
+
+    type = req-&amp;gt;type;
+    
+    switch (type) {
+    case VIRTIO_BLK_T_IN:
+    case VIRTIO_BLK_T_OUT:
+
+        /*  对于读写请求，调用bdev读写接口，并注册请求完成后的回调函数为blk_request_complete_cb */
+        if (type == VIRTIO_BLK_T_IN) {
+            task-&amp;gt;used_len = payload_len + sizeof(*task-&amp;gt;status);
+            rc = spdk_bdev_readv(bvdev-&amp;gt;bdev_desc, bvdev-&amp;gt;bdev_io_channel,
+                    &amp;amp;task-&amp;gt;iovs[1], task-&amp;gt;iovcnt, req-&amp;gt;sector * 512,
+                    payload_len, blk_request_complete_cb, task);
+        } else if (!bvdev-&amp;gt;readonly) {
+            task-&amp;gt;used_len = sizeof(*task-&amp;gt;status);
+            rc = spdk_bdev_writev(bvdev-&amp;gt;bdev_desc, bvdev-&amp;gt;bdev_io_channel,
+                    &amp;amp;task-&amp;gt;iovs[1], task-&amp;gt;iovcnt, req-&amp;gt;sector * 512,
+                    payload_len, blk_request_complete_cb, task);
+        } else {
+            SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, &quot;Device is in read-only mode!\n&quot;);
+            rc = -1;
+        }
+        break;
+    case VIRTIO_BLK_T_GET_ID:
+        ...
+        break;
+    default:
+        ...
+        return -1;
+    }   
+
+    return 0;
+}
+
+static int
+blk_iovs_setup(struct spdk_vhost_dev *vdev, struct spdk_vhost_virtqueue *vq, uint16_t req_idx,
+                struct iovec *iovs, uint16_t *iovs_cnt, uint32_t *length)
+{
+    struct vring_desc *desc, *desc_table;
+    uint16_t out_cnt = 0, cnt = 0;
+    uint32_t desc_table_size, len = 0;
+    int rc;
+
+    /* 从IO环descriptor数组中获取请求对应的所有内存段信息，并映射成vva地址 */
+    rc = spdk_vhost_vq_get_desc(vdev, vq, req_idx, &amp;amp;desc, &amp;amp;desc_table, &amp;amp;desc_table_size);
+    ...
+
+    while (1) {
+        ...
+        len += desc-&amp;gt;len;
+
+        out_cnt += spdk_vhost_vring_desc_is_wr(desc);
+
+        rc = spdk_vhost_vring_desc_get_next(&amp;amp;desc, desc_table, desc_table_size);
+        if (rc != 0) {
+            ...
+            return -1;
+        } else if (desc == NULL) {
+            break;
+        }
+    }
+
+    ...
+
+    *length = len;
+    *iovs_cnt = cnt;
+    return 0;
+}
+
+int
+spdk_vhost_vq_get_desc(struct spdk_vhost_dev *vdev, struct spdk_vhost_virtqueue *virtqueue,
+                    uint16_t req_idx, struct vring_desc **desc, struct vring_desc **desc_table,
+                    uint32_t *desc_table_size)
+{
+    
+    *desc = &amp;amp;virtqueue-&amp;gt;vring.desc[req_idx];
+
+    if (spdk_vhost_vring_desc_is_indirect(*desc)) {
+        assert(spdk_vhost_dev_has_feature(vdev, VIRTIO_RING_F_INDIRECT_DESC));
+        *desc_table_size = (*desc)-&amp;gt;len / sizeof(**desc);
+        
+        /* 将IO环中记录的gpa地址转换成vhost的虚拟地址，qemu和vhost之间的内存映射关系管理我们将在管理面分析时讨论 */
+        *desc_table = spdk_vhost_gpa_to_vva(vdev, (*desc)-&amp;gt;addr, sizeof(**desc) * *desc_table_size);
+        *desc = *desc_table;
+        if (*desc == NULL) {
+            return -1;
+        }
+
+        return 0;
+    }
+
+    *desc_table = virtqueue-&amp;gt;vring.desc;
+    *desc_table_size = virtqueue-&amp;gt;vring.size;
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  接着，我们看一下bdev层对IO请求的处理，以读请求为例：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/bdev/bdev.c:
+
+int
+spdk_bdev_readv(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+                struct iovec *iov, int iovcnt,
+                uint64_t offset, uint64_t nbytes,
+                spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+    uint64_t offset_blocks, num_blocks;
+
+    ...
+    
+    /* 将字节转换成块进行实际的IO操作 */
+    return spdk_bdev_readv_blocks(desc, ch, iov, iovcnt, offset_blocks, num_blocks, cb, cb_arg);
+}
+
+int spdk_bdev_readv_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+                            struct iovec *iov, int iovcnt,
+                            uint64_t offset_blocks, uint64_t num_blocks,
+                            spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+    struct spdk_bdev *bdev = desc-&amp;gt;bdev;
+    struct spdk_bdev_io *bdev_io;
+    struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
+
+    /* io channel是一个线程强相关对象，不同的线程对应不同的channel，
+        这里spdk_bdev_channel包含一个线程独立的缓存池，先从中申请bdev_io内存(免锁)，
+        如果申请不到，再到全局的mempool中申请内存 */
+    bdev_io = spdk_bdev_get_io(channel);
+    ...
+
+    /*  将接口参数记录到bdev_io中，并继续递交 */
+    bdev_io-&amp;gt;ch = channel;
+    bdev_io-&amp;gt;type = SPDK_BDEV_IO_TYPE_READ;
+    bdev_io-&amp;gt;u.bdev.iovs = iov;
+    bdev_io-&amp;gt;u.bdev.iovcnt = iovcnt;
+    bdev_io-&amp;gt;u.bdev.num_blocks = num_blocks;
+    bdev_io-&amp;gt;u.bdev.offset_blocks = offset_blocks;
+    spdk_bdev_io_init(bdev_io, bdev, cb_arg, cb);
+
+    spdk_bdev_io_submit(bdev_io);
+    return 0;
+}
+
+static void
+spdk_bdev_io_submit(struct spdk_bdev_io *bdev_io)
+{
+    struct spdk_bdev *bdev = bdev_io-&amp;gt;bdev;
+
+    if (bdev_io-&amp;gt;ch-&amp;gt;flags &amp;amp; BDEV_CH_QOS_ENABLED) { /* 开启了bdev的qos特性时走该流程 */
+        ...
+    } else {
+        _spdk_bdev_io_submit(bdev_io); /* 直接递交 */
+    }
+}
+
+static void
+_spdk_bdev_io_submit(void *ctx)
+{
+    struct spdk_bdev_io *bdev_io = ctx;
+    struct spdk_bdev *bdev = bdev_io-&amp;gt;bdev;
+    struct spdk_bdev_channel *bdev_ch = bdev_io-&amp;gt;ch;
+    struct spdk_io_channel *ch = bdev_ch-&amp;gt;channel; /* 底层驱动对应的io channel */
+    struct spdk_bdev_module_channel	*module_ch = bdev_ch-&amp;gt;module_ch;
+
+    bdev_io-&amp;gt;submit_tsc = spdk_get_ticks();
+    bdev_ch-&amp;gt;io_outstanding++;
+    module_ch-&amp;gt;io_outstanding++;
+    bdev_io-&amp;gt;in_submit_request = true;
+    if (spdk_likely(bdev_ch-&amp;gt;flags == 0)) {
+        if (spdk_likely(TAILQ_EMPTY(&amp;amp;module_ch-&amp;gt;nomem_io))) {
+            /* 不同的驱动在生成bdev对象时会注册不同的fn_table，这里将调用驱动注册的submit_request函数 */
+            bdev-&amp;gt;fn_table-&amp;gt;submit_request(ch, bdev_io);
+        } else {
+            bdev_ch-&amp;gt;io_outstanding--;
+            module_ch-&amp;gt;io_outstanding--;
+            TAILQ_INSERT_TAIL(&amp;amp;module_ch-&amp;gt;nomem_io, bdev_io, link);
+        }
+    } else if (bdev_ch-&amp;gt;flags &amp;amp; BDEV_CH_RESET_IN_PROGRESS) {
+        ...
+    } else if (bdev_ch-&amp;gt;flags &amp;amp; BDEV_CH_QOS_ENABLED) {
+        ...
+    } else {
+        ...
+    }
+    bdev_io-&amp;gt;in_submit_request = false;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  最后，我们来看一下bdev的NVMe驱动的处理逻辑：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/bdev/bdev_nvme.c:
+
+static const struct spdk_bdev_fn_table nvmelib_fn_table = {
+    .destruct           = bdev_nvme_destruct,
+    .submit_request		= bdev_nvme_submit_request,
+    .io_type_supported	= bdev_nvme_io_type_supported,
+    .get_io_channel		= bdev_nvme_get_io_channel,
+    .dump_info_json		= bdev_nvme_dump_info_json,
+    .write_config_json	= bdev_nvme_write_config_json,
+    .get_spin_time		= bdev_nvme_get_spin_time,
+};
+
+static void
+bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+    int rc = _bdev_nvme_submit_request(ch, bdev_io);
+
+    if (spdk_unlikely(rc != 0)) {
+        if (rc == -ENOMEM) {
+            spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
+        } else {
+            spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+        }
+    }
+}
+
+static int
+_bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
+{
+    /* 将ch扩展成具体的nvme_io_channel，其对应一个queue parir */
+    struct nvme_io_channel *nvme_ch = spdk_io_channel_get_ctx(ch);
+    if (nvme_ch-&amp;gt;qpair == NULL) {
+        /* The device is currently resetting */
+        return -1;
+    }
+
+    switch (bdev_io-&amp;gt;type) {
+
+    /* 针对读写请求，会将bdev_io扩展成nvme_bdev_io请求后，再将请求内容填入io channel
+        对应的queue pair中，并通知物理硬件处理 */
+    case SPDK_BDEV_IO_TYPE_READ:
+        spdk_bdev_io_get_buf(bdev_io, bdev_nvme_get_buf_cb,
+                        bdev_io-&amp;gt;u.bdev.num_blocks * bdev_io-&amp;gt;bdev-&amp;gt;blocklen);
+        return 0;
+
+    case SPDK_BDEV_IO_TYPE_WRITE:
+        return bdev_nvme_writev((struct nvme_bdev *)bdev_io-&amp;gt;bdev-&amp;gt;ctxt,
+                                ch,
+                                (struct nvme_bdev_io *)bdev_io-&amp;gt;driver_ctx,
+                                bdev_io-&amp;gt;u.bdev.iovs,
+                                bdev_io-&amp;gt;u.bdev.iovcnt,
+                                bdev_io-&amp;gt;u.bdev.num_blocks,
+                                bdev_io-&amp;gt;u.bdev.offset_blocks);
+    ...
+    default:
+        return -EINVAL;
+    }
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+&lt;p&gt;  详细的NVMe请求处理不在本文的讨论范围内，感兴趣的读者可以自行深入分析。&lt;/p&gt;
+
+&lt;h3 id=&quot;io响应返回流程代码解析&quot;&gt;IO响应返回流程代码解析&lt;/h3&gt;
+
+&lt;p&gt;  reactor线程通过bdev_nvme_poll函数获知已完成的NVMe响应，最终会调用bdev层的spdk_bdev_io_complete来处理响应：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/bdev/bdev.c:
+
+void
+spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
+{
+    ...
+    bdev_io-&amp;gt;status = status;
+
+    ...
+    _spdk_bdev_io_complete(bdev_io);
+}
+
+static inline void
+_spdk_bdev_io_complete(void *ctx)
+{
+    struct spdk_bdev_io *bdev_io = ctx;
+
+    ...
+
+    /* 如果请求执行成功，则更新一些统计信息 */
+    if (bdev_io-&amp;gt;status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+        switch (bdev_io-&amp;gt;type) {
+        case SPDK_BDEV_IO_TYPE_READ:
+            bdev_io-&amp;gt;ch-&amp;gt;stat.bytes_read += bdev_io-&amp;gt;u.bdev.num_blocks * bdev_io-&amp;gt;bdev-&amp;gt;blocklen;
+            bdev_io-&amp;gt;ch-&amp;gt;stat.num_read_ops++;
+            bdev_io-&amp;gt;ch-&amp;gt;stat.read_latency_ticks += (spdk_get_ticks() - bdev_io-&amp;gt;submit_tsc);
+            break;
+        case SPDK_BDEV_IO_TYPE_WRITE:
+            bdev_io-&amp;gt;ch-&amp;gt;stat.bytes_written += bdev_io-&amp;gt;u.bdev.num_blocks * bdev_io-&amp;gt;bdev-&amp;gt;blocklen;
+            bdev_io-&amp;gt;ch-&amp;gt;stat.num_write_ops++;
+            bdev_io-&amp;gt;ch-&amp;gt;stat.write_latency_ticks += (spdk_get_ticks() - bdev_io-&amp;gt;submit_tsc);
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* 调用上层注册回调，这里将回到vhost-blk的blk_request_complete_cb */
+    bdev_io-&amp;gt;cb(bdev_io, bdev_io-&amp;gt;status == SPDK_BDEV_IO_STATUS_SUCCESS, bdev_io-&amp;gt;caller_ctx);
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;spdk/lib/vhost/vhost_blk.c:
+
+static void
+blk_request_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+    struct spdk_vhost_blk_task *task = cb_arg;
+
+    spdk_bdev_free_io(bdev_io); /* 释放bdev_io */
+    blk_request_finish(success, task);
+}
+
+static void
+blk_request_finish(bool success, struct spdk_vhost_blk_task *task)
+{
+    *task-&amp;gt;status = success ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
+
+    /* 往虚拟机中放入响应并以虚拟中断方式通知虚拟机IO完成 */
+    spdk_vhost_vq_used_ring_enqueue(&amp;amp;task-&amp;gt;bvdev-&amp;gt;vdev, task-&amp;gt;vq, task-&amp;gt;req_idx,
+            task-&amp;gt;used_len);
+
+    /* 释放当前task，实际就是将task-&amp;gt;used置为false */
+    blk_task_finish(task);
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  至此，整个IO流程已经分析完毕，可见SPDK对IO的处理还是非常简洁的，这便是高性能的基石。&lt;/p&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-ioanalyze/&quot;&gt;【SPDK】三、IO流程代码解析&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Wed, 16 May 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/05/SPDK-ioanalyze/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/05/SPDK-ioanalyze/</guid>
+        
+        <category>SPDK</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【SPDK】二、IO栈对比与线程模型</title>
+        <description>&lt;p&gt;  这里我们以SPDK前端配置成vhost-blk、后端配置成NVMe SSD场景为例，来分析SPDK的IO栈和线程模型。&lt;/p&gt;
+
+&lt;h3 id=&quot;io栈对比与时延分析&quot;&gt;IO栈对比与时延分析&lt;/h3&gt;
+
+&lt;p&gt;  我们先来对比一下qemu使用普通内核NVMe驱动和使用SPDK vhost时IO栈的差别，如下图所示：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/spdk/iostack.jpg&quot; height=&quot;550&quot; width=&quot;750&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  无论使用传统内核NVMe驱动，还是使用vhost，虚拟机内部的IO处理流程都是一样的：IO请求下发时需要从用户态应用程序中切换到内核态，并穿过文件系统和virtio-blk驱动后，才能借助IO环(IO Ring)将请求信息传递给虚拟设备进行处理；虚拟设备处理完成后，以中断方式通知虚拟机，虚拟机内进过驱动和文件系统的回调后，最终唤醒应用程序返回用户态继续执行业务逻辑。在intel Xeon E5620@2.4GHz服务器上的测试结果表明，虚拟机内部的请求下发与响应处理总时延约15us。&lt;/p&gt;
+
+&lt;p&gt;  针对传统内核NVMe驱动，qemu进程中io线程负责处理虚拟机下发的IO请求：它通过virtio backend从IO环中取出请求，并将请求通过系统调用传递给内核块层和NVMe驱动层进行处理，最后由NVMe驱动将请求通过Queue Pair(类似IO环)交由物理NVMe控制器进行处理；NVMe控制器处理完成后以物理中断方式通知qemu io线程，由它将响应放入虚拟机IO环中并以虚拟中断通知虚拟机请求完成。在此我们看到，qemu中总共的处理时延约15us，而NVMe硬件(华为ES3000 NVMe SSD)上的处理时延才10us(读请求)。&lt;/p&gt;
+
+&lt;p&gt;  针对SPDK vhost，qemu进程不参与IO请求的处理(仅在初始化时起作用)，所有虚拟机下发的IO请求均由vhost进程处理。vhost进程以轮循的方式不断从IO环中取出请求(意味着虚拟机下发IO请求时，不用通知虚拟设备)，对于取出的每个请求，vhost将其以任务方式交给bdev抽象层进行处理；bdev根据后端设备的类型来选择不同的驱动进行处理，例如对于NVMe设备，将使用用户态的NVMe驱动在用户空间完成对Queue Pair的操作。vhost进程同样会轮循物理NVMe设备的Queue Pair，如果有响应例会立刻进行处理，而无须等待物理中断。vhost在处理NVMe响应过程中，会向虚拟机IO环中添加响应，并以虚拟中断方式通知虚拟机。我们可以看到，vhost中绝大部分操作都是在用户态完成的(中断通知虚拟机时会进入内核态通过KVM模块完成)，各层时延均非常短，app和bdev抽象层约2us，NVMe用户态驱动约2us。&lt;/p&gt;
+
+&lt;p&gt;  因此,端到端时延对比来看，我们可以发现传统NVMe IO栈的总时延约40us，而SPDK用户态NVMe IO栈时延不到30us，&lt;strong&gt;时延上有25%以上的优化&lt;/strong&gt;。另一方面，在吞吐量(IOPS)方面，如果我们给virtio-blk设备配置多队列(确保虚拟机IO压力足够)，并在后端NVMe设备不成为瓶颈的前提下，传统NVMe IO栈在单个qemu io线程处理时，最多能达到20万IOPS，而SPDK vhost在单线程处理时可达100万IOPS，&lt;strong&gt;同等CPU开销下，吞吐量上有5倍以上的性能提升&lt;/strong&gt;。传统NVMe IO栈在处理多队列模型时，相比单队列模型，减少了线程间通知开销，一次通知可以处理多个IO请求，因此多队列相比单队列模型会有较大的IOPS提升；而vhost得益于全用户态及轮循模式，进一步减少了内核切换和通知开销，带来了吞吐量的大幅提升。&lt;/p&gt;
+
+&lt;h3 id=&quot;线程模型分析&quot;&gt;线程模型分析&lt;/h3&gt;
+
+&lt;p&gt;  在了解了SPDK的IO栈之后，我们进一步来分析一下vhost进程的线程模型，如下图所示。图中示例场景为，一台服务器上插了一张NVMe SSD卡，卡上划分了三个namespace；三个namespace分别配给了三台虚拟机的vhost-user-blk-pci设备。&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/spdk/thread.jpg&quot; height=&quot;560&quot; width=&quot;550&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  vhost进程启动时可以配置多个轮循线程(reactor)，每个线程绑定一个物理CPU。在示例场景下，我们假设配置了两个轮循线程reactor_0和reactor_1，分别对应物理CPU0和物理CPU1。每配置一个vhost-blk设备时，同样要为该设备绑定物理核，并且只能绑定到一个物理核上，例如这里我们假设vm1的vhost-blk设备绑定到CPU0，vm2和vm3绑定到CPU1。那么reactor_0将轮循vm1中vhost-blk的IO环，reactor_1将依次轮循vm2和vm3的IO环。&lt;/p&gt;
+
+&lt;p&gt;  vhost线程在操作相同NVMe控制器下的namespace时，不同的vhost线程会申请不同的IO Channel(实际对应NVMe Queue Pair，作用类似虚拟机IO环)，并且每个线程都会轮循各自申请的IO Channel中的响应消息。例如图中reactor_0会向NVMe控制器申请QueuePair1，并在轮循过程中注册对该QueuePair的poller函数(负责从中取响应)；reactor_1则会向NVMe控制器申请QueuePair2并轮循该QueuePair。如此一来，就能提升对后端NVMe设备的并发访问度，充分发挥物理设备的吞吐量优势。&lt;/p&gt;
+
+&lt;p&gt;  综上所述，&lt;/p&gt;
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;每个vhost线程都会轮循若干个vhost设备的IO环(一个vhost设备无论有多少个环，都只会在一个线程中处理)，并且会向有操作述求的物理存储控制器(例如NVMe控制器、virtio-blk控制器、virtio-scsi控制器等)申请一个独立的IO Channel(IO环可以理解为对前端虚拟机呈现的一个IO Channel)并对其进行轮循。&lt;/li&gt;
+    &lt;li&gt;无论是前端虚拟机IO环，还是后端IO Channel，都只会在一个vhost线程中被轮循，因此这就避免了多线程并发操作同一个对象，可以通过无锁的方式操作IO环或IO Channel。&lt;/li&gt;
+    &lt;li&gt;针对前端虚拟机来说，一个vhost设备无论有多少个环，都只会在一个vhost线程中处理。这种设计上的约束虽说可以简化实现，但也带来了吞吐量性能扩展上的限制，即一个vhost设备在后端物理存储非瓶颈的前提下，最高的IOPS为100万。因此我们可以考虑将vhost的多个IO环拆分到多个vhost线程中处理，进一步提升吞吐量。&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-iostack/&quot;&gt;【SPDK】二、IO栈对比与线程模型&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Tue, 15 May 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/05/SPDK-iostack/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/05/SPDK-iostack/</guid>
+        
+        <category>SPDK</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【SPDK】一、概述</title>
+        <description>&lt;p&gt;  随着越来越多公有云服务提供商采用SPDK技术作为其高性能云存储的核心技术之一，intel推出的SPDK技术备受业界关注。本篇博文就和大家一起探索SPDK。&lt;/p&gt;
+
+&lt;h3 id=&quot;什么是spdk为什么需要它&quot;&gt;什么是SPDK？为什么需要它？&lt;/h3&gt;
+
+&lt;p&gt;  SPDK(全称Storage Performance Development Kit)，提供了一整套工具和库，以实现高性能、扩展性强、全用户态的存储应用程序。它是继DPDK之后，intel在存储领域推出的又一项颠覆性技术，旨在大幅缩减存储IO栈的软件开销，从而提升存储性能，可以说它就是为了存储性能而生。&lt;/p&gt;
+
+&lt;p&gt;  为便于大家理解，我们先介绍一下SPDK在虚拟化场景下的使用方法，以给大家一些直观的认识。&lt;/p&gt;
+
+&lt;h4 id=&quot;1-dpdk的编译与安装&quot;&gt;&lt;strong&gt;1. DPDK的编译与安装&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  SPDK使用了DPDK中一些通用的功能和机制，因此首先需要下载DPDK的源码并完成编译和安装：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;[root@linux:~/DPDK]# &lt;strong&gt;make config T=x86_64-native-linuxapp-gcc&lt;/strong&gt;&lt;br /&gt;
+[root@linux:~/DPDK]# &lt;strong&gt;make&lt;/strong&gt;&lt;br /&gt;
+[root@linux:~/DPDK]# &lt;strong&gt;make install&lt;/strong&gt; (默认安装到/usr/local，包括.a库文件和头文件)&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h4 id=&quot;2-spdk的编译&quot;&gt;&lt;strong&gt;2. SPDK的编译&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;[root@linux:~/SPDK]# &lt;strong&gt;./configure –with-dpdk=&lt;/strong&gt;/usr/local&lt;br /&gt;
+[root@linux:~/SPDK]# &lt;strong&gt;make&lt;/strong&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;  编译成功后，我们在spdk/app/vhost目录下可以看到一个名为vhost的可执行文件，它就是SPDK在虚拟化场景下为虚拟机模拟程序qemu提供的存储转发服务，借此为虚拟机用户带来高性能的虚拟磁盘。&lt;/p&gt;
+
+&lt;h4 id=&quot;3-大页内存配置&quot;&gt;&lt;strong&gt;3. 大页内存配置&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  SPDK vhost进程和qemu进程通过大页共享虚拟机可见内存，因此需要进行一些大页的配置和调整：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;可通过设置/sys/kernel/mm/hugepages/hugepages-xxx/nr_hugepages来调整大页数量(xxx通常为2M或1G)&lt;/li&gt;
+    &lt;li&gt;qemu使用挂载到/dev/hugepages目录下的hugetlbfs来使用大页内存，可在挂载参数中指定大页大小，如mount -t hugetlbfs -o pagesize=1G nodev /dev/hugepages&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;h4 id=&quot;4-vhost配置与启动&quot;&gt;&lt;strong&gt;4. vhost配置与启动&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;[root@linux:~/SPDK]# &lt;strong&gt;HUGEMEM=&lt;/strong&gt;4096 &lt;strong&gt;scripts/setup.sh&lt;/strong&gt;&lt;br /&gt;
+[root@linux:~/SPDK]# &lt;strong&gt;app/vhost/vhost -S&lt;/strong&gt; /var/tmp &lt;strong&gt;-m&lt;/strong&gt; 0x3 &lt;strong&gt;-c&lt;/strong&gt; etc/spdk/rootw.conf&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;  vhost命令执行过程中，是一个常驻的服务进程；-S参数指定了socket文件的生成的目录，每个虚拟磁盘(vhost-blk)或虚拟存储控制器(vhost-scsi)都会在该目录下产生一个socket文件，以便qemu程序与vhost进程建立连接；-m参数指定了vhost进程中的轮循线程所绑定的物理CPU核，例如0x3代表在0号和1号核上各绑定一个轮循线程；-c参数指定了vhost进程所需的配置文件，例如这里我通过内存设备(SPDK中称之为Malloc设备)提供了一个vhost-blk磁盘：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;[root@linux:~/SPDK]# &lt;strong&gt;cat&lt;/strong&gt; etc/spdk/rootw.conf &lt;br /&gt;
+[root@linux:~/SPDK]#  &lt;br /&gt;
+&lt;strong&gt;[Malloc]&lt;/strong&gt;  &lt;br /&gt;
+NumberOfLuns 1   #创建一个内存设备，默认名称为Malloc0  &lt;br /&gt;
+LunSizeInMB 128  #该内存设备大小为128M  &lt;br /&gt;
+BlockSize 4096   #该内存设备块大小为4096字节  &lt;br /&gt;
+&lt;strong&gt;[VhostBlk0]&lt;/strong&gt;  &lt;br /&gt;
+Name vhost.2     #创建一个vhost-blk设备，名称为vhost.2  &lt;br /&gt;
+Dev Malloc0      #该设备后端对应的物理设备为Malloc0  &lt;br /&gt;
+Cpumask 0x1      #将该设备绑定到0号核的轮循线程上&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;h4 id=&quot;5-虚拟机启动与验证&quot;&gt;&lt;strong&gt;5. 虚拟机启动与验证&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  vhost进程启动后，我们就可以拉起qemu进程来启动一个新虚拟机，qemu进程的命令行参数如下(重点关注与SPDK vhost相关部分)：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;p&gt;[root@linux:~/qemu]# &lt;strong&gt;./x86_64-softmmu/qemu-system-x86_64&lt;/strong&gt; -name rootw-vm -machine pc-i440fx-2.6,accel=kvm \  &lt;br /&gt;
+&lt;strong&gt;-m 1G -object memory-backend-file,id=mem,size=1G,mem-path=/dev/hugepages,share=on -numa node,memdev=mem&lt;/strong&gt; \  &lt;br /&gt;
+-drive file=/mnt/centos.qcow2,format=qcow2,id=virtio-disk0,cache=none,aio=native -device virtio-blk-pci,drive=virtio-disk0,id=blk0 \  &lt;br /&gt;
+&lt;strong&gt;-chardev socket,id=char_rootw,path=/var/tmp/vhost.2 -device vhost-user-blk-pci,id=blk_rootw,chardev=char_rootw&lt;/strong&gt; \  &lt;br /&gt;
+-vnc 0.0.0.0:0&lt;/p&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;  通过上述启动参数，我们可以看出：&lt;/p&gt;
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;vhost进程和qemu进程通过大页方式共享虚拟机可见的所有内存(原因我们将在深入分析时讨论)&lt;/li&gt;
+    &lt;li&gt;qemu在配置vhost-user-blk-pci设备时，只需要指定vhost生成的socket文件即可(-S参数指定的路径后拼接上设备名称)&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;  虚拟机启动成功后，我们通过vnc工具登陆虚拟机，执行lsblk命令可以查看到vda和vdb两个virtio-blk块设备，表明vhost后端已成功生效。这里要说明一下，qemu中配置的virtio-blk-pci设备、vhost-user-blk-pci设备或vhost-blk-pci设备，在虚拟机内部均呈现为virtio-blk-pci设备，因此在虚拟机中采用相同的virtio-blk-pci和virtio-blk驱动进行使能，如此一来不同的后端实现技术在虚拟机内部均采用一套驱动，可以减少驱动的开发和维护工作量。&lt;/p&gt;
+
+&lt;h3 id=&quot;如何实现spdk&quot;&gt;如何实现SPDK?&lt;/h3&gt;
+
+&lt;p&gt;  SPDK能实现高性能，得益于以下三个关键技术：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;&lt;strong&gt;全用户态&lt;/strong&gt;，它把所有必要的驱动全部移到了用户态，避免了系统调用的开销并真正实现内存零拷贝&lt;/li&gt;
+    &lt;li&gt;&lt;strong&gt;轮循模式&lt;/strong&gt;，针对高速物理存储设备，采用轮循的方式而非中断通知方式判断请求完成，大大降低时延并减少性能波动&lt;/li&gt;
+    &lt;li&gt;&lt;strong&gt;无锁机制&lt;/strong&gt;，在IO路径上避免采用任何锁机制进行同步，降低时延并提升吞吐量&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;  下面我们将深入到SPDK的实现细节，去看看这些关键点分别是如何提升性能的。&lt;/p&gt;
+
+&lt;h4 id=&quot;1-整体架构&quot;&gt;&lt;strong&gt;1. 整体架构&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  首先，我们来了解一下SPDK内部的整体组件架构：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/spdk/arch.png&quot; height=&quot;300&quot; width=&quot;550&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  SPDK整体分为三层：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;存储协议层(Storage Protocols)，指SPDK支持存储应用类型。iSCSI Target对外提供iSCSI服务，用户可以将运行SPDK服务的主机当前标准的iSCSI存储设备来使用；vhost-scsi或vhost-blk对qemu提供后端存储服务，qemu可以基于SPDK提供的后端存储为虚拟机挂载virtio-scsi或virtio-blk磁盘；NVMF对外提供基于NVMe协议的存储服务端。注意，图中vhost-blk在spdk-18.04版本中已实现，后面我们主要基于此版本进行代码分析。&lt;/li&gt;
+    &lt;li&gt;存储服务层(Storage Services)，该层实现了对块和文件的抽象。目前来说，SPDK主要在块层实现了QoS特性，这一层整体上还是非常薄的。&lt;/li&gt;
+    &lt;li&gt;驱动层(drivers)，这一层实现了存储服务层定义的抽象接口，以对接不同的存储类型，如NVMe，RBD，virtio，aio等等。图中把驱动细分成两层，和块设备强相关的放到了存储服务层，而把和硬件强相关部分放到了驱动层。&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;h4 id=&quot;2-深入数据面&quot;&gt;&lt;strong&gt;2. 深入数据面&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  接下来我们将以SPDK前端配置成vhost-blk、后端配置成NVMe SSD场景为例，来分析整个数据面流程。我们将分两部分完成数据面的分析：&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-iostack/&quot;&gt;IO栈对比与线程模型&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-ioanalyze/&quot;&gt;IO流程代码解析&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;h4 id=&quot;3-深入管理面&quot;&gt;&lt;strong&gt;3. 深入管理面&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  管理面流程比数据面要复杂得多，也无趣得多。因此我们在分析完数据面流程之后，再回头看看数据面中涉及的各个对象分别是如何被创建和初始化的，这样更利于我们理解这样做的目的，也不会一下子就被这些复杂的流程吓住而无法坚持往下分析。&lt;/p&gt;
+
+&lt;p&gt;  整个管理面功能包含vhost启动初始化和通过rpc动态管理两个部分，这里我们主要讨化启动初始化，根据启动时的先后顺序，分为&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-reactors-init/&quot;&gt;reactor线程初始化&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-subsys-bdev/&quot;&gt;bdev子系统初始化&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-subsys-vhost/&quot;&gt;vhost子系统初始化&lt;/a&gt;&lt;/li&gt;
+  &lt;li&gt;&lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-vhost-msg-handle&quot;&gt;vhost客户端(qemu)连接请求处理&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/05/SPDK-all/&quot;&gt;【SPDK】一、概述&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Thu, 10 May 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/05/SPDK-all/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/05/SPDK-all/</guid>
+        
+        <category>SPDK</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【Rados Block Device】九、Monitor原理分析</title>
+        <description>&lt;p&gt;  Monitors是ceph集群的管理节点，负责维护整个集群的全局信息(如OSDMap)；Client和OSD加入和退出集群时，都需要和Monitors打交道，而且都需要从Monitors中获取最新的全局信息(如OSDMap)进行相关操作(如CRUSH数据映射)。 CatKang的&lt;a href=&quot;https://www.jianshu.com/p/60b34ba5cdf2&quot;&gt;博文&lt;/a&gt;对Monitor进行了比较多全的分析，这里我只补充一些自己的理解。Monitor的代码分析大家可以对照原理分析自行开展，略显枯燥，paxos算法相关原理可参考&lt;a href=&quot;https://www.cnblogs.com/linbingdong/p/6253479.html&quot;&gt;此篇博文&lt;/a&gt;，不过注意一点，ceph没有完全按照paxos来实现，作了一定的修改。&lt;/p&gt;
+
+&lt;h3 id=&quot;架构&quot;&gt;架构&lt;/h3&gt;
+
+&lt;p&gt;  Monitor整体架构如下所示，注意，这里没有体现网络层，其原理和OSD中分析的类似，请参考messenger模块分析：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_monitor_arch.jpg&quot; height=&quot;280&quot; width=&quot;400&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  从总体处理流程上来看，Monitor首先也是通过messenger模块接收网络消息；接着对于不同的全局信息提供不同的PaxosService；但是对于这些服务都会提交给Paxos模块处理，该模块实现了核心的Paxos算法；对于更新请求，最终Paxos会将更新内容提交到底层的数据库中进行存储。&lt;/p&gt;
+
+&lt;h3 id=&quot;初始化流程&quot;&gt;初始化流程&lt;/h3&gt;
+
+&lt;p&gt;  Monitor初始化整体流程如下图所示：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_monitor_init.jpg&quot; height=&quot;450&quot; width=&quot;600&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  初始化过程中，网络messenger模块执行的动作和OSD是一样的，只不过这里只需要一个public messenger对象(Monitor不接入cluster网络平面)。消息的处理是由Monitor对象(类似OSD进程中的OSD对象)进行的，入口函数在Monitor::dispatch_op。&lt;/p&gt;
+
+&lt;h4 id=&quot;1-bootstrap发现&quot;&gt;&lt;strong&gt;1. bootstrap发现&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  网络模块初始化完成后，Monitor首先进行的是bootstrap动作，通过网络协商的方式加入到Monitor集群中(quorum)：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_monitor_probe.jpg&quot; height=&quot;400&quot; width=&quot;600&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;h4 id=&quot;2-election选主&quot;&gt;&lt;strong&gt;2. election选主&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  bootstrap发现其它Monitor节点后，将进行一轮选主动作，从所有Monitor中选出一个Leader，而其它Monitor就成为Peon(劳工)。选主的目的是只有Leader可以向所有Monitor发起信息变更请求，解决Paxos算法中的&lt;strong&gt;活性&lt;/strong&gt;问题。所有Monitor都可以响应查询请求。选主流程如下：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_monitor_election.jpg&quot; height=&quot;400&quot; width=&quot;600&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;h4 id=&quot;3-recovery恢复&quot;&gt;&lt;strong&gt;3. recovery恢复&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  选主完成后，Leader将发起恢复动作，在所有Monitor之间进行数据信息的同步：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_monitor_recovery.jpg&quot; height=&quot;400&quot; width=&quot;600&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;h3 id=&quot;数据服务流程&quot;&gt;数据服务流程&lt;/h3&gt;
+
+&lt;p&gt;  所有的初始化动作完成后，Monitor进入ACTIVE状态，即可响应其它节点的读写请求。前面已经说过，对于读请求，所有Monitor均可直接提供数据信息且不涉及内部状态变化；对于写请求，只有Leader能发起变更申请(Peon只能将写请求转发给Leader发请)，在写请求被正式接受之前，Monitor是不能提供该信息的读取服务的。写请求被接受的流程如下：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_monitor_update.jpg&quot; height=&quot;400&quot; width=&quot;600&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/04/RBD-Monitor&quot;&gt;【Rados Block Device】九、Monitor原理分析&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Wed, 18 Apr 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/04/RBD-Monitor/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/04/RBD-Monitor/</guid>
+        
+        <category>ceph</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【Rados Block Device】八、OSD原理分析－FileStore模块</title>
+        <description>&lt;p&gt;  从前面的博文分析中，我们知道OSD模块在请求处理的最后阶段会向ObjectStore发起操作请求，ObjectStore负责对象的实际存储功能，有filestore、bluestore、memstore、kstore等多种存储方式，这里我们以基本的filestore为例展开分析。&lt;/p&gt;
+
+&lt;h3 id=&quot;filestore模块中对象流程概览&quot;&gt;FileStore模块中对象、流程概览&lt;/h3&gt;
+
+&lt;p&gt;  我们照例先整体来看一下FileStore模块的对象和流程：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_osd_fs.jpg&quot; height=&quot;500&quot; width=&quot;800&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  OSD模块在tp_osd_tp线程上下文的最后阶段，通过queue_transactions调用FileStore模块功能将操作请求以日志的方式提交到日志队列中，至此tp_osd_tp线程中的工作就完成了。后续由一个独立的日志写入线程journal_write从日志队列中取出操作日志并调用文件系统写入接口将日志操作写入实际的日志文件中(&lt;strong&gt;注，这里我们以journal ahead模式为例进行说明&lt;/strong&gt;)；日志写入完成后，通过queue_completions_thru接口将日志完成回调任务放入fn_jrn_objstorep线程的完成队列中。fn_jrn_objstore线程从完成队列中取出回调任务并立即调用回调，回调任务中会执行两个并发的子任务：一方面是通过op_queue将操作递交给OpWQ进行实际的数据落盘动作；另一方面是把OSD模块传入的回调任务放入fn_odsk_fstore线程池中进行处理。OpWQ队列对应tp_fstore_op线程，它会从队列中取出操作请求，并执行实际的数据落盘动作，落盘完成后再把落盘回调任务放入到fn_appl_fstore队列中进行回调处理。fn_odsk_fstore在处理OSD模块的回调任务时，会把OSD复本操作减一(因为写入日志后就认为本地写入操作完成了)，如果远端OSD复本也完成了，那就会对客户端返回操作结果。此外，还有一个fileStore_sync线程负责日志空间的回收，便于重复使用日志文件。&lt;/p&gt;
+
+&lt;h3 id=&quot;filestore模块中类的概览&quot;&gt;FileStore模块中类的概览&lt;/h3&gt;
+
+&lt;p&gt;  下面我们来看看FileStore模块中涉及的主要类及其关系：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_osd_fs_class.jpg&quot; height=&quot;550&quot; width=&quot;800&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  &lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;JournalingObjectStore是FileStore的父类，继承自抽象父类ObjectStore。JournalingObjectStore包含一个Journal对象和一个Finisher对象，分别代表日志操作对象和日志操作完成后的回调对象。&lt;/li&gt;
+    &lt;li&gt;FileJournal继承了Journal类，以文件的方式实现了日志的主要操作功能。内部有一个专门的journal_write线程负责日志的落盘操作。&lt;/li&gt;
+    &lt;li&gt;FileStore是核心类，继承自JournalingObjectStore。OpWQ队列用来存放数据落盘请求，op_tp线程池会从该队列中取出请求执行落盘动作。sync_thread线程负责数据同步与日志空间回收。ondisk_finishers用来处理日志落盘后的回调；apply_finishers用来处理数据落盘后的回调。&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;h3 id=&quot;代码详解&quot;&gt;代码详解&lt;/h3&gt;
+
+&lt;h4 id=&quot;1-初始化过程&quot;&gt;&lt;strong&gt;1. 初始化过程&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  filestore的初始化由FileStore::mount完成，其调用栈如下所示，大家可以自行展开阅读：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph_osd.cc:main()
+    \-OSD::init()
+        \-FileStore::mount()
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h4 id=&quot;2-tp_osd_tp线程上下文的日志提交&quot;&gt;&lt;strong&gt;2. tp_osd_tp线程上下文的日志提交&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  我们先来分析一下tp_osd_tp线程中的日志提交过程，其栈心处理函数为FileStore::queue_transactions：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;FileStore::queue_transactions()
+    |-ObjectStore::Transaction::collect_context()
+    |-FileStore::build_op()
+    |-JournalFile::prepare_entry()
+    \-JournalingObjectStore::_op_journal_transaction()
+        \-JournalFile::submit_entry()
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/os/filestore/FileStore.cc:
+
+int FileStore::queue_transactions(Sequencer *posr, vector&amp;lt;Transaction&amp;gt;&amp;amp; tls,
+        TrackedOpRef osd_op, ThreadPool::TPHandle *handle)
+{
+    Context *onreadable;
+    Context *ondisk;
+    Context *onreadable_sync;
+
+    /*将所有事务中的回调分类进行汇总，onreadable代表on_applied，即数据落盘后的回调；
+      ondisk代表on_commit代表日志落盘后的回调；onreadable_sync代表on_applied_sync代表
+      数据落盘并同步完成后的回调*/
+    ObjectStore::Transaction::collect_contexts(tls, &amp;amp;onreadable, &amp;amp;ondisk, &amp;amp;onreadable_sync);
+    ...
+
+    if (journal &amp;amp;&amp;amp; journal-&amp;gt;is_writeable() &amp;amp;&amp;amp; !m_filestore_journal_trailing) {
+        /*封装一个新的操作op*/
+        Op *o = build_op(tls, onreadable, onreadable_sync, osd_op);
+        /*准备日志块内容，内部包含操作类型和操作数据*/
+        int orig_len = journal-&amp;gt;prepare_entry(o-&amp;gt;tls, &amp;amp;tbl);
+        
+        /*OSD中对日志主要有两使用方式：parallel和writeahead。parallel代表日志落盘和数据落盘同时发起
+          writeahead代表日志先落盘，成功后再发起数据落盘。这里我们主要讨论writeahead模式*/
+        if (m_filestore_journal_parallel) {
+            ...
+        }else if (m_filestore_journal_writeahead) {
+            /*提交日志到日志队列，并封装一个回调对象C_JournalAhead*/
+            _op_journal_transactions(tbl, orig_len, o-&amp;gt;op,
+                new C_JournaledAhead(this, osr, o, ondisk), osd_op);
+        }
+    }
+    ...
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/os/filestore/JournalingObjectStore.cc:
+
+void JournalingObjectStore::_op_journal_transactions(
+        bufferlist&amp;amp; tbl, uint32_t orig_len, uint64_t op,
+        Context *onjournal, TrackedOpRef osd_op)
+{
+    ...
+    journal-&amp;gt;submit_entry(op, tbl, orig_len, onjournal, osd_op);
+    ...
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  C_JournaledAhead回调对象最终会调用FileStore::_journaled_ahead，代码如下：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/os/filestore/FileStore.cc:
+
+struct C_JournaledAhead : public Context {
+    FileStore *fs;
+    FileStore::OpSequencer *osr;
+    FileStore::Op *o;
+    Context *ondisk;
+
+    C_JournaledAhead(FileStore *f, FileStore::OpSequencer *os, FileStore::Op *o, Context *ondisk):
+        fs(f), osr(os), o(o), ondisk(ondisk) { }
+    void finish(int r) override {
+        fs-&amp;gt;_journaled_ahead(osr, o, ondisk);
+    }
+};
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h4 id=&quot;3-journal_write线程工作过程&quot;&gt;&lt;strong&gt;3. journal_write线程工作过程&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  tp_osd_tp线程将日志提交到日志队列是通过JournalFile::submit_entry实现的：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/os/filestore/JournalFile.cc:
+
+void FileJournal::submit_entry(uint64_t seq, bufferlist&amp;amp; e, uint32_t orig_len,
+        Context *oncommit, TrackedOpRef osd_op)
+{
+    ...
+    /*先在compleions列表中记录回调对象*/
+    completions.push_back(
+        completion_item(seq, oncommit, ceph_clock_now(), osd_op));
+
+    /*唤醒journal_write线程*/
+    if (writeq.empty())
+        writeq_cond.Signal();
+
+    /*将待提交日志放入日志队列writeq中*/
+    writeq.push_back(write_item(seq, e, orig_len, osd_op));
+    ...
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  这里我们看看journal_write线程的工作原理，线程入口函数为FileJournal::write_thread_entry：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/os/filestore/JournalFile.cc:
+
+void FileJournal::write_thread_entry()
+{
+    ...
+    while (1) {
+        ...
+
+        bufferlist bl;
+        /*从日志队列writeq中取出若干日志项*/
+        int r = prepare_multi_write(bl, orig_ops, orig_bytes);
+        ...
+
+        /*将日志项写入到日志文件中，如果非direct io，会执行fdatasync；执行完成后将回调对象送入fn_jrn_objstore处理*/
+        do_write(bl);
+
+        /*记录日志写入完成事件*/
+        complete_write(orig_ops, orig_bytes);
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h4 id=&quot;4-fn_jrn_objstore回调&quot;&gt;&lt;strong&gt;4. fn_jrn_objstore回调&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  日志完全落盘执行的回调即是前文指出的FileStore::_journaled_ahead，它会触发两个并行的操作：&lt;/p&gt;
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;通过queue_op触发tp_fstore_op的数据落盘操作；&lt;/li&gt;
+    &lt;li&gt;通地Finisher::queue触发OSD模块的回调&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/os/filestore/FileStore.cc:
+
+void FileStore::_journaled_ahead(OpSequencer *osr, Op *o, Context *ondisk)
+{
+    queue_op(osr, o);
+    
+    if (ondisk) {
+        ondisk_finishers[osr-&amp;gt;id % m_ondisk_finisher_num]-&amp;gt;queue(ondisk);
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h4 id=&quot;5a-tp_fstore_op线程的数据落盘及fn_appl_fstore线程池的落盘回调&quot;&gt;&lt;strong&gt;5.(a) tp_fstore_op线程的数据落盘及fn_appl_fstore线程池的落盘回调&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  queue_op操作将落盘请求放入op_wq队列后，将由tp_fstore_op线程处理，该线程将周期性地调用_process和_process_finish函数：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/os/filestore/FileStore.h:
+
+struct OpWQ : public ThreadPool::WorkQueue&amp;lt;OpSequencer&amp;gt; {
+    FileStore *store;
+    ...
+
+    void _process(OpSequencer *osr, ThreadPool::TPHandle &amp;amp;handle) override {
+        store-&amp;gt;_do_op(osr, handle);
+    }
+    
+    void _process_finish(OpSequencer *osr) override {
+        store-&amp;gt;_finish_op(osr);
+    }
+
+} op_wq;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  FileStore::_do_op负责将数据落盘，FileStore::_finish_op负责将回调对象送入fn_appl_fstore线程池进入处理。&lt;/p&gt;
+
+&lt;h4 id=&quot;5b-fn_odsk_fstore线程池对osd模块传入的日志落盘回调的处理&quot;&gt;&lt;strong&gt;5.(b) fn_odsk_fstore线程池对OSD模块传入的日志落盘回调的处理&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  OSD传入的日志落盘回调对象为C_OSD_OnOpCommit，其实现代码为：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/osd/ReplicatedBackend.cc:
+
+class C_OSD_OnOpCommit : public Context {
+    ReplicatedBackend *pg;
+    ReplicatedBackend::InProgressOp *op;
+public:
+    C_OSD_OnOpCommit(ReplicatedBackend *pg, ReplicatedBackend::InProgressOp *op) 
+        : pg(pg), op(op) {}
+    void finish(int) override {
+        pg-&amp;gt;op_commit(op);
+    }
+};
+
+void ReplicatedBackend::op_commit(InProgressOp *op)
+{
+    /*将当前多复本操作等待对象中减去本地OSD，代表本地复本已完成*/
+    op-&amp;gt;waiting_for_commit.erase(get_parent()-&amp;gt;whoami_shard());
+
+    /*如果等待队列为空，表示远端OSD复本操作也完了，那就可以执行复本操作全部完成后的回调*/
+    if (op-&amp;gt;waiting_for_commit.empty()) {
+        op-&amp;gt;on_commit-&amp;gt;complete(0); /*复本操作全部完成后将给客户端返回结果*/
+        op-&amp;gt;on_commit = 0;
+    }
+    if (op-&amp;gt;done()) {
+        assert(!op-&amp;gt;on_commit &amp;amp;&amp;amp; !op-&amp;gt;on_applied);
+        in_progress_ops.erase(op-&amp;gt;tid);
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/04/RBD-OSD-3&quot;&gt;【Rados Block Device】八、OSD原理分析－FIleStore模块&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Fri, 13 Apr 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/04/RBD-OSD-3/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/04/RBD-OSD-3/</guid>
+        
+        <category>ceph</category>
+        
+        
+      </item>
+    
+      <item>
+        <title>【Rados Block Device】七、OSD原理分析－OSD模块</title>
+        <description>&lt;p&gt;  OSD进程从网络收到客户端的读写请求后，交由OSD模块执行核心的请求处理逻辑，本篇博文将讨论OSD模块的实现原理。&lt;/p&gt;
+
+&lt;h3 id=&quot;osd模块中对象流程概览&quot;&gt;OSD模块中对象、流程概览&lt;/h3&gt;
+
+&lt;p&gt;  我们先整体来看一下OSD模块的对象和流程：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_osd_osd.jpg&quot; height=&quot;500&quot; width=&quot;800&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  回顾前文对SimpleMessenger的分析，我们看到ms_pipe_read线程从网络中收到请求消息后，通过fast_dispatch接口将消息分发给OSD对象进行处理。OSD对象针对接收到的每一个消息，都会将它们放入一个工作队列中(ShardedOpWQ，片式队列)。到这里，ms_pipe_read线程的分发动作就执行完了。对于一个片式队列，会有若干个处理线程，即图中的tp_osd_tp线程，每个处理线程负责处理不同分片中的消息。它们将各自分片中的消息取出后，找到每个消息对应的PG对象(Placement Group)，进而将消息封装成操作(op)转给PG对象处理。PG对象针对读操作将直接从filestore中读出内容并返回响应消息给客户端；而对于写操作，PG对象将请求以事务(Transaction)的方式提交给PGBackend对象(本文主要讨论ReplicatedBackend)，最终事务内的操作会转变成对filestore的操作(我们将在独立的博文中讨论filestore模块的实现原理)。&lt;/p&gt;
+
+&lt;p&gt;  为什么一个请求消息要在两个线程(ms_pipe_read和tp_osd_tp)间传递处理？其实这里体现了ceph一个核心的设计理念：&lt;strong&gt;流水线&lt;/strong&gt;。将请求的处理分成多个步骤，每个步骤放在不同的线程中处理；请求从一个线程流动到下一个线程，类似工产里的流水流；这样可以大大提升处理请求的吞吐量(即每秒完成的请求数量)。那么时延呢？&lt;/p&gt;
+
+&lt;h3 id=&quot;osd模块中类的概览&quot;&gt;OSD模块中类的概览&lt;/h3&gt;
+
+&lt;p&gt;  下面我们来看看OSD模块中涉及的主要类及其关系：&lt;/p&gt;
+
+&lt;div align=&quot;center&quot;&gt;
+&lt;img src=&quot;/images/posts/ceph/rbd_osd_osd_class.jpg&quot; height=&quot;500&quot; width=&quot;800&quot; /&gt;  
+&lt;/div&gt;
+
+&lt;p&gt;  &lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;OSD是核心类，它内部包含两个Messenger对象指针，分别指向cluster网络(cluster_messenger)和public网络(client_messenger)。store指向后端对象存储池，用来进行实际的对象存取操作。内部包含一个片式队列(ShardedOpWQ)和一个处理线程池(SharedThreadPool)，OSD对象将请求消息放入片式队列中，再由不同的处理线程从队列中取出消息进行下一步处理。OSD中还包含全局的OSDMap和映射到本OSD的所有PG对象。&lt;/li&gt;
+    &lt;li&gt;ShardedOpWQ类代表片式队列，number_shards是队列中总的分片数，每个分片都包含一个ShardedData，其内部有一个优先级队列用来接收请求消息(通过_enqueue操作)。每个片式队列都关联一个处理线程池，池中的每个线程都通过_process接口从对应队列中取出消息进行后续处理。&lt;/li&gt;
+    &lt;li&gt;PrimaryLogPG类继承PG类，代表具体的Placement Group的一种实现。每个PrimaryLogPG对象包含一个pgbackend对象，该对象负责数据复本的处理。目前有两种数据复本的实现方式，Replicated(复制)和EC(校验码)，分别对应ReplicatedBackend和ECBackend。&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;h3 id=&quot;代码详解&quot;&gt;代码详解&lt;/h3&gt;
+
+&lt;h4 id=&quot;1-初始化过程&quot;&gt;&lt;strong&gt;1. 初始化过程&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  OSD模块的初始化代码位于OSD:init中，代码流程比较锁碎。这里我们给出初始化调用栈，并作一些简要说明：&lt;/p&gt;
+
+&lt;blockquote&gt;
+  &lt;ul&gt;
+    &lt;li&gt;在挂载后端ObjectStore后，OSD模块调用load_pgs开始加载后端ObjectStore中保存的pg对象。这里先枚举ObjectStore中所有的pg，例如对于filestore，将查找CURRENT目录下的所有子目录(每个子目录代表一个pg)；然后打开该pg(生成具体的PG对象，如PrimaryLogPG)并读取pg状态信息。&lt;/li&gt;
+    &lt;li&gt;启动osd_op_tp线程池，开始对op_shardedwq中的消息进行处理。&lt;/li&gt;
+  &lt;/ul&gt;
+&lt;/blockquote&gt;
+
+&lt;p&gt;  &lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph_osd.cc:main()
+    \-OSD::init()
+        |-OSD::load_pgs()
+        |   |-ObjectStore::list_collections()
+        |   |-OSD::_open_lock_pg()
+        |   |-ObjectStore::open_collections()
+        |   \-PG::read_state()
+        \-osd_op_tp.start()
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;h4 id=&quot;2-请求处理过程&quot;&gt;&lt;strong&gt;2. 请求处理过程&lt;/strong&gt;&lt;/h4&gt;
+
+&lt;p&gt;  我们先来分析一下ms_pipe_read中的请求消息分发流程，其栈心处理函数为OSD::ms_fast_dispatch：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;OSD::ms_fast_dispatch()
+    |-OpTracker::create_request()
+    \-OSD::dispatch_session_waiting()
+        \-OSD::enqueue_op()
+            \-ShardedOpWQ::queue()
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/osd/OSD.cc:
+
+void OSD::ms_fast_dispatch(Message *m)
+{
+    /*将消息封装成op*/
+    OpRequestRef op = op_tracker.create_request&amp;lt;OpRequest, Message*&amp;gt;(m);
+    ...
+    
+    if (m-&amp;gt;get_connection()-&amp;gt;has_features(CEPH_FEATUREMASK_RESEND_ON_SPLIT) ||
+        m-&amp;gt;get_type() != CEPH_MSG_OSD_OP) {
+        // queue it directly
+        ...
+    } else {
+        // legacy client, and this is an MOSDOp (the *only* fast dispatch
+        // message that didn't have an explicit spg_t); we need to map
+        // them to an spg_t while preserving delivery order.
+
+        /*将op放入当前连接的会话上下文中，待获取到OSDMap后进行处理*/
+        Session *session = static_cast&amp;lt;Session*&amp;gt;(m-&amp;gt;get_connection()-&amp;gt;get_priv());
+        if (session) {
+            {
+                Mutex::Locker l(session-&amp;gt;session_dispatch_lock);
+                op-&amp;gt;get();
+                session-&amp;gt;waiting_on_map.push_back(*op);
+                OSDMapRef nextmap = service.get_nextmap_reserved();
+                dispatch_session_waiting(session, nextmap);
+                service.release_map(nextmap);
+            }
+            session-&amp;gt;put();
+        }
+    } 
+}
+
+void OSD::dispatch_session_waiting(Session *session, OSDMapRef osdmap)
+{
+    /*遍历session中waiting_on_map中的每个op进行处理*/
+    auto i = session-&amp;gt;waiting_on_map.begin();
+    while (i != session-&amp;gt;waiting_on_map.end()) {
+        OpRequestRef op = &amp;amp;(*i);
+        const MOSDFastDispatchOp *m = static_cast&amp;lt;const MOSDFastDispatchOp*&amp;gt;(op-&amp;gt;get_req());
+        ...
+        session-&amp;gt;waiting_on_map.erase(i++);
+        op-&amp;gt;put();
+
+        spg_t pgid;
+        if (m-&amp;gt;get_type() == CEPH_MSG_OSD_OP) {
+            /*根据消息中记录的pg(对象名称的hash值)计算实际pg(根据pg数取余)*/
+            pg_t actual_pgid = osdmap-&amp;gt;raw_pg_to_pg(static_cast&amp;lt;const MOSDOp*&amp;gt;(m)-&amp;gt;get_pg());
+            if (!osdmap-&amp;gt;get_primary_shard(actual_pgid, &amp;amp;pgid)) {
+                continue;
+            }
+        } else {
+            pgid = m-&amp;gt;get_spg();
+        }
+        /*依据实际pgid将消息放入片式队列*/
+        enqueue_op(pgid, op, m-&amp;gt;get_map_epoch());
+    }
+    ...
+}
+
+void OSD::enqueue_op(spg_t pg, OpRequestRef&amp;amp; op, epoch_t epoch)
+{
+    ...
+    op_shardedwq.queue(make_pair(pg, PGQueueable(op, epoch)));
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  接下来我们看一下tp_osd_tp线程是如何处理分片中的请求，线程处理的核心函数是ShardedOpWQ::_process，其调用栈如下：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ShardedOpWQ::_process()
+    |-OpQueue&amp;lt;&amp;gt;::dequeue()
+    |-OSD::_look_up_pg()
+    \-PGQueueable::run()
+        \-PrimrayLogPG::do_request()
+            \-PrimaryLogPG::do_op()
+                \-PrimaryLogPG::execute_ctx()
+                    |-PrimaryLogPG::prepare_transaction()
+                    |   \-PrimaryLogPG::do_osd_ops()
+                    \-PrimaryLogPG::issue_repop()
+                        \-ReplicatedBackend::submit_transaction()
+                            |-ReplicatedBackend::generate_transaction()
+                            |-ReplicatedBackend::issue_op()
+                            \-PrimaryLogPG::queue_transactions()
+                                \-ObjectStore::queue_transactions()
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/osd/OSD.cc:
+
+void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
+{
+    /*通过线程号取余的方式找到每个线程片时的分片，可能存在两个线程处理一个分片的情况*/
+    uint32_t shard_index = thread_index % num_shards;
+    ShardData *sdata = shard_list[shard_index];
+    
+    /*通过锁机制同步请求的放入与取出，以及多个线程并发取出的场景*/
+    sdata-&amp;gt;sdata_op_ordering_lock.Lock();
+    ...
+
+    /*取出一个操作对象到item*/
+    pair&amp;lt;spg_t, PGQueueable&amp;gt; item = sdata-&amp;gt;pqueue-&amp;gt;dequeue();
+    ...
+
+    sdata-&amp;gt;sdata_op_ordering_lock.Unlock();
+    ...
+
+    /*查找item对应的pg对象并为该pg加锁，类型为PrimaryLogPG*/
+    pg = osd-&amp;gt;_lookup_lock_pg(item.first);
+    ...
+
+    sdata-&amp;gt;sdata_op_ordering_lock.Lock();
+    ...
+
+    /*对于查找到的pg对象会放入一个临时的slot结构中进行同步加锁*/
+    qi = slot.to_process.front();
+    slot.to_process.pop_front();
+    ...
+
+    sdata-&amp;gt;sdata_op_ordering_lock.Unlock();
+    ...
+
+    /*调用实际的处理函数，最终将执行PrimaryLogPG::do_request()*/
+    qi-&amp;gt;run(osd, pg, tp_handle);
+    ...
+
+    /*解锁pg*/
+    pg-&amp;gt;unlock();
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  每个PG在处理op时，会为当前op以及op操作的对象生成一个context，用来保存此次操作相关的信息：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/osd/PrimaryLogPG.cc:
+
+void PrimaryLogPG::do_request(OpRequestRef&amp;amp; op, ThreadPool::TPHandle &amp;amp;handle)
+{
+    .../*针对op进行一系列的有效性判断*/
+
+    switch (op-&amp;gt;get_req()-&amp;gt;get_type()) {
+    /*针对不同的请求类型进行不同的处理*/
+    case CEPH_MSG_OSD_OP:
+        do_op(op);
+        break;
+    ...
+    }
+}
+
+void PrimaryLogPG::do_op(OpRequestRef&amp;amp; op)
+{
+    .../*还是一堆锁碎的状态检查*/
+    
+    MOSDOp *m = static_cast&amp;lt;MOSDOp*&amp;gt;(op-&amp;gt;get_nonconst_req());
+    ...
+    
+    /*在当前PG中查找或生成一个新的对象上下文，用来保存对象修改的相关信息*/
+    ObjectContextRef obc;
+    int r = find_object_context(
+            oid, &amp;amp;obc, can_create,
+            m-&amp;gt;has_flag(CEPH_OSD_FLAG_MAP_SNAP_CLONE),
+            &amp;amp;missing_oid);
+    ...
+    
+    /*生成一个新op上下文*/
+    OpContext *ctx = new OpContext(op, m-&amp;gt;get_reqid(), &amp;amp;m-&amp;gt;ops, obc, this);
+    ...
+
+    /*执行该op上下文*/
+    execute_ctx(ctx);
+    ...
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  PG在执行op上下文时，会使用事务的方式保证多个修改操作的原子性。另外事务具有多个层级，PG中使用PGTransaction；底层ObjectStore中会使用ObjectStore::Transaction进行进一步封装。&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/osd/PrimaryLogPG.cc:
+
+void PrimaryLogPG::execute_ctx(OpContext *ctx)
+{
+    OpRequestRef op = ctx-&amp;gt;op; /*上下文上包含的op*/
+    const MOSDOp *m = static_cast&amp;lt;const MOSDOp*&amp;gt;(op-&amp;gt;get_req()); /*op对应的原始请求消息*/
+    ObjectContextRef obc = ctx-&amp;gt;obc; /*op操作的对象上下文*/
+    const hobject_t&amp;amp; soid = obc-&amp;gt;obs.oi.soid; /*对象id*/
+
+    ctx-&amp;gt;op_t.reset(new PGTransaction); /*设置一个新的PGTransaction事务对象*/
+    ...
+
+    /*将上下文中的多个子操作放入到事务中，普通读写只有一个子操作*/
+    int result = prepare_transaction(ctx);
+    ...
+
+    /*对于读操作，在prepare_transaction中将完成对象的读取，这里将直接返回响应消息给客户端*/
+    if ((ctx-&amp;gt;op_t-&amp;gt;empty() || result &amp;lt; 0) &amp;amp;&amp;amp; !ctx-&amp;gt;update_log_only) {
+        ...
+        complete_read_ctx(result, ctx);
+        return;
+    }
+    
+    /*以下均针对写操作*/
+    
+    /*注册所有复本写操作均完成后的回调函数，该函数将发送响应给客户端*/
+    ctx-&amp;gt;register_on_commit(...);
+    ...
+
+    /*生成一组复本操作，并将这些操作发射出去：本地复本将写到后端ObjectStore，远端复本将通过网络消息发送并等待响应*/
+    ceph_tid_t rep_tid = osd-&amp;gt;get_tid();
+
+    RepGather *repop = new_repop(ctx, obc, rep_tid);
+
+    issue_repop(repop, ctx);
+    eval_repop(repop);
+    repop-&amp;gt;put();
+}
+
+int PrimaryLogPG::prepare_transaction(OpContext *ctx)
+{
+    ...
+    int result = do_osd_ops(ctx, *ctx-&amp;gt;ops);
+    ...
+｝
+
+int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector&amp;lt;OSDOp&amp;gt;&amp;amp; ops)
+{
+    ...
+    /*循环处理每个子操作*/
+    for (vector&amp;lt;OSDOp&amp;gt;::iterator p = ops.begin(); p != ops.end(); ++p, ctx-&amp;gt;current_osd_subop_num++) {
+        OSDOp&amp;amp; osd_op = *p;
+        ceph_osd_op&amp;amp; op = osd_op.op;
+
+        switch (op.op) {
+        ...
+        case CEPH_OSD_OP_READ:
+            ++ctx-&amp;gt;num_read;
+            result = do_read(ctx, osd_op);
+            break;
+        ...
+        case CEPH_OSD_OP_WRITE:
+            ++ctx-&amp;gt;num_write;
+            t-&amp;gt;write(soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
+            break;
+        ...
+        }
+    }
+}
+
+int PrimaryLogPG::do_read(OpContext *ctx, OSDOp&amp;amp; osd_op)
+{
+    ...
+
+    /*针对读请求，通过后端同步读接口直接读取对象内容*/
+    int r = pgbackend-&amp;gt;objects_read_sync(
+            soid, op.extent.offset, op.extent.length, op.flags, &amp;amp;osd_op.outdata);
+    ...
+}
+
+ceph/src/osd/PGTransaction.h:
+
+/*针对写操作，会将几个关键参数放入事务的buffer_updates中*/
+void write(
+    const hobject_t &amp;amp;hoid,         ///&amp;lt; [in] object to write
+    uint64_t off,                  ///&amp;lt; [in] off at which to write
+    uint64_t len,                  ///&amp;lt; [in] len to write from bl
+    bufferlist &amp;amp;bl,                ///&amp;lt; [in] bl to write will be claimed to len
+    uint32_t fadvise_flags = 0     ///&amp;lt; [in] fadvise hint
+) {
+    auto &amp;amp;op = get_object_op_for_modify(hoid);
+    op.buffer_updates.insert(
+        off,
+        len,
+        ObjectOperation::BufferUpdate::Write{bl, fadvise_flags});
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  针对写操作的多复本操作，将会提交给ReplicatedBackend对象进行处理：&lt;/p&gt;
+
+&lt;div class=&quot;highlighter-rouge&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;ceph/src/osd/PrimaryLogPG.cc:
+
+void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
+{
+    ...
+
+    /*生成复本操作全部完成后的回调对象*/
+    Context *on_all_commit = new C_OSD_RepopCommit(this, repop);
+    Context *on_all_applied = new C_OSD_RepopApplied(this, repop);
+    ...
+
+    /*递交给ReplicatedBackend对象处理*/
+    pgbackend-&amp;gt;submit_transaction(
+        soid,
+        ctx-&amp;gt;delta_stats,
+        ctx-&amp;gt;at_version,
+        std::move(ctx-&amp;gt;op_t),
+        pg_trim_to,
+        min_last_complete_ondisk,
+        ctx-&amp;gt;log,
+        ctx-&amp;gt;updated_hset_history,
+        onapplied_sync,
+        on_all_applied,
+        on_all_commit,
+        repop-&amp;gt;rep_tid,
+        ctx-&amp;gt;reqid,
+        ctx-&amp;gt;op);
+}
+
+ceph/src/osd/ReplicatedBackend.cc:
+
+void ReplicatedBackend::submit_transaction(
+    const hobject_t &amp;amp;soid,
+    const object_stat_sum_t &amp;amp;delta_stats,
+    const eversion_t &amp;amp;at_version,
+    PGTransactionUPtr &amp;amp;&amp;amp;_t,
+    const eversion_t &amp;amp;trim_to,
+    const eversion_t &amp;amp;roll_forward_to,
+    const vector&amp;lt;pg_log_entry_t&amp;gt; &amp;amp;_log_entries,
+    boost::optional&amp;lt;pg_hit_set_history_t&amp;gt; &amp;amp;hset_history,
+    Context *on_local_applied_sync,
+    Context *on_all_acked,
+    Context *on_all_commit,
+    ceph_tid_t tid,
+    osd_reqid_t reqid,
+    OpRequestRef orig_op)
+{
+    ObjectStore::Transaction op_t;
+    ...
+    
+    /*将PGTransaction对象封装到ObjectStore:: Transaction中*/
+    generate_transaction(
+        t,
+        coll,
+        (get_osdmap()-&amp;gt;require_osd_release &amp;lt; CEPH_RELEASE_KRAKEN),
+        log_entries,
+        &amp;amp;op_t,
+        &amp;amp;added,
+        &amp;amp;removed);
+
+    /*生成一个新的代表当前操作对象的InProgressOp*/
+    InProgressOp &amp;amp;op = in_progress_ops.insert(
+        make_pair(
+            tid,
+            InProgressOp(
+                tid, on_all_commit, on_all_acked,
+                orig_op, at_version)
+        )
+    ).first-&amp;gt;second;
+
+    /*记录当前操作需要等待哪些OSD返回结果，包含本地OSD和远端OSD*/
+    op.waiting_for_applied.insert(
+        parent-&amp;gt;get_actingbackfill_shards().begin(), parent-&amp;gt;get_actingbackfill_shards().end());
+    op.waiting_for_commit.insert(
+        parent-&amp;gt;get_actingbackfill_shards().begin(), parent-&amp;gt;get_actingbackfill_shards().end());
+
+    /*对于发往远端OSD的复本请求，通过网络发送CEPH_MSG_REPOP消息*/
+    issue_op(
+        soid,
+        at_version,
+        tid,
+        reqid,
+        trim_to,
+        at_version,
+        added.size() ? *(added.begin()) : hobject_t(),
+        removed.size() ? *(removed.begin()) : hobject_t(),
+        log_entries,
+        hset_history,
+        &amp;amp;op,
+        op_t);
+
+    /*对于发送本地OSD的复本请求*/
+    /*先注册本地完成后的回调*/
+    op_t.register_on_applied_sync(on_local_applied_sync);/*写到数据区并同步回刷之后触发*/
+    op_t.register_on_applied(
+        parent-&amp;gt;bless_context(new C_OSD_OnOpApplied(this, &amp;amp;op)));/*写到数据区之后触发*/
+    op_t.register_on_commit(
+        parent-&amp;gt;bless_context(new C_OSD_OnOpCommit(this, &amp;amp;op)));/*提交到日志区之后触发*/
+    
+    /*再将事务发送给后端存储池进行处理*/
+    vector&amp;lt;ObjectStore::Transaction&amp;gt; tls;
+    tls.push_back(std::move(op_t));
+
+    parent-&amp;gt;queue_transactions(tls, op.op); /*最终会调用不同ObjectStore的queue_transactions函数*/
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;/div&gt;
+
+&lt;p&gt;  OSD模块整体分析完毕，后续我们将继续分析FileStore的实现原理。&lt;/p&gt;
+
+&lt;p&gt;&lt;br /&gt;
+转载请注明：&lt;a href=&quot;https://rootw.github.io&quot;&gt;吴斌的博客&lt;/a&gt; » &lt;a href=&quot;https://rootw.github.io/2018/04/RBD-OSD-2&quot;&gt;【Rados Block Device】七、OSD原理分析－OSD模块&lt;/a&gt;&lt;/p&gt;
+</description>
+        <pubDate>Wed, 11 Apr 2018 00:00:00 +0800</pubDate>
+        <link>http://localhost:4000/2018/04/RBD-OSD-2/</link>
+        <guid isPermaLink="true">http://localhost:4000/2018/04/RBD-OSD-2/</guid>
+        
+        <category>ceph</category>
+        
+        
+      </item>
+    
+  </channel>
+</rss>

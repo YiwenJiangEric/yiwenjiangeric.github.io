@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html>
+
+  <head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+  <title>【计算子系统】内存管理之六：初始化</title>
+  <meta name="description" content="  初始化过程往往是比较冗长且乏味的，如果一接触就开始学习这块内容会让人烦闷。在了解内存管理几个核心功能模块后，我们再回头看看内存管理的初始化过程，相信大家会有新的收获。计算子系统相关内容目录点此进入。">
+  <meta name="author" content="leopardpan">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="【计算子系统】内存管理之六：初始化">
+  <meta name="twitter:description" content="  初始化过程往往是比较冗长且乏味的，如果一接触就开始学习这块内容会让人烦闷。在了解内存管理几个核心功能模块后，我们再回头看看内存管理的初始化过程，相信大家会有新的收获。计算子系统相关内容目录点此进入。">
+  
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="【计算子系统】内存管理之六：初始化">
+  <meta property="og:description" content="  初始化过程往往是比较冗长且乏味的，如果一接触就开始学习这块内容会让人烦闷。在了解内存管理几个核心功能模块后，我们再回头看看内存管理的初始化过程，相信大家会有新的收获。计算子系统相关内容目录点此进入。">
+  
+  <link rel="icon" type="image/png" href="/images/favicon.png" />
+  <link href="/images/favicon.png" rel="shortcut icon" type="image/png">
+  
+  <link rel="stylesheet" href="/css/main.css">
+  <link href="//netdna.bootstrapcdn.com/font-awesome/4.1.0/css/font-awesome.min.css" rel="stylesheet">
+
+  <link rel="canonical" href="http://localhost:4000/2017/12/%E5%86%85%E5%AD%98%E5%88%9D%E5%A7%8B%E5%8C%96/">
+  <link rel="alternate" type="application/rss+xml" title="吴斌" href="http://localhost:4000/feed.xml">
+  
+  <meta name="google-site-verification" content="1-1ZlHoRvM0T2FqPbW2S-qLgYXN6rsn52kErlMPd_gw" />
+
+<!-- 站点统计 -->
+  <script 
+  async src="//dn-lbstatics.qbox.me/busuanzi/2.3/busuanzi.pure.mini.js">
+  </script>  
+
+<!-- 百度统计 -->
+  
+
+<!-- google 统计 -->
+  
+
+</head>
+
+
+  <body>
+
+    <span class="mobile btn-mobile-menu">        
+      <div class="nav_container">
+         <nav class="nav-menu-item" style = "float:right">
+            <i class="nav-menu-item">
+              <a href="/#blog" title="" class="blog-button">  博客主页
+              </a>
+            </i>
+            
+                <i class="nav-menu-item">
+
+                  <a href="/archive" title="archive" class="btn-mobile-menu__icon">
+                      所有文章
+                  </a>
+                </i>
+            
+                <i class="nav-menu-item">
+
+                  <a href="/tags" title="tags" class="btn-mobile-menu__icon">
+                      标签
+                  </a>
+                </i>
+            
+                <i class="nav-menu-item">
+
+                  <a href="/about" title="about" class="btn-mobile-menu__icon">
+                      关于我
+                  </a>
+                </i>
+            
+          </nav>
+      </div>
+    </span>
+    
+    <header class="panel-cover panel-cover--collapsed" style="background-image: url('/images/background-cover.jpg')">
+  <div class="panel-main">
+
+    <div class="panel-main__inner panel-inverted">
+    <div class="panel-main__content">
+        <!-- 头像效果-start -->
+        <div class="ih-item circle effect right_to_left">            
+            <a href="/#blog" title="前往 吴斌 的主页" class="blog-button">
+                <div class="img"><img src="/images/avatar.jpg" alt="img"></div>
+                <div class="info">
+                    <div class="info-back">
+                        <h2> 
+                            
+                                DigDeeply
+                            
+                        </h2>
+                        <p>
+                           
+                                系统编程<br>内核/虚拟化
+                            
+                        </p>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <!-- 头像效果-end -->
+        <h1 class="panel-cover__title panel-title"><a href="/#blog" title="link to homepage for 吴斌" class="blog-button">吴斌</a></h1>
+        
+        <span class="panel-cover__subtitle panel-subtitle">个人主页</span>
+        
+        <hr class="panel-cover__divider" />
+        <p class="panel-cover__description">欢迎来到我的技术博客~</p>
+        <hr class="panel-cover__divider panel-cover__divider--secondary" />
+        
+        
+        
+
+        <div class="navigation-wrapper">
+          <div>
+            <nav class="cover-navigation cover-navigation--primary">
+              <ul class="navigation">
+                <li class="navigation__item"><a href="/#blog" title="" class="blog-button">博客主页</a></li>
+                
+                  <li class="navigation__item"><a href="/archive" title="archive">所有文章</a></li>
+                
+                  <li class="navigation__item"><a href="/tags" title="tags">标签</a></li>
+                
+                  <li class="navigation__item"><a href="/about" title="about">关于我</a></li>
+                
+              </ul>
+            </nav>
+          </div>          
+        </div>
+
+
+        </div>
+      </div>
+    </div>
+    
+    
+    <div class="panel-cover--overlay cover-clear"></div>
+    
+  </div>
+</header>
+
+
+    <div class="content-wrapper">
+        <div class="content-wrapper__inner">
+            <article class="post-container post-container--single" itemscope itemtype="http://schema.org/BlogPosting">
+  <header class="post-header">
+    <h1 class="post-title">【计算子系统】内存管理之六：初始化</h1>
+    <div class="post-meta">
+      <img src="/images/calendar.png" width="20px"/> 
+      <time datetime="2017-12-29 00:00:00 +0800" itemprop="datePublished" class="post-meta__date date">2017-12-29</time>  
+         
+      <span id="busuanzi_container_page_pv"> | 阅读：<span id="busuanzi_value_page_pv"></span>次</span>
+    </p>
+    </div>
+  </header>
+
+  <section class="post">
+    <p>  初始化过程往往是比较冗长且乏味的，如果一接触就开始学习这块内容会让人烦闷。在了解内存管理几个核心功能模块后，我们再回头看看内存管理的初始化过程，相信大家会有新的收获。计算子系统相关内容目录<a href="https://rootw.github.io/2017/02/计算子系统/">点此进入</a>。</p>
+
+<h3 id="低级阶段-汇编实现">低级阶段-汇编实现</h3>
+
+<p>  我们可以把整个内存初始化过程大体分成低级阶段和高级阶段两个过程。低级阶段主要是用低级汇编语言实现的，又可细分成三步：</p>
+
+<p>  首先是BIOS，它在计算机启动的最初阶段检测了物理内存的分布情况，并在x86实模式的高端地址处(1M内存以下)记录了这些内存分布信息(称为e820表)。e820表是一个数组，每一项记录了一段连续内存信息，包含起始地址、结束地址和内存类型。内存类型分为普通内存(RAM)、保留内存(RESERVED，如BIOS内存)、ACPI表空间等。此外，对于NUMA结构系统，BIOS还将产生ACPI的SRAT表，用来记录每个numa节点的内存分布。</p>
+
+<p>  接着BIOS通过引导GRUB，再由GRUB将内核实模式部分和保护模式部分加载进内存。之后GRUB跳转到内核实模式部分执行，此时内核通过int指令获取e820表信息，由此得知物理内存分布。</p>
+
+<p>  在低级阶段的最后，内核进入保护模式，设置了高端虚拟地址到物理地址的线性映射，并将栈空间设定在了0号进程(BSP启动核对应的IDLE进程)的栈空间，随后就进入了高级阶段。</p>
+
+<h3 id="高级阶段-c语言实现">高级阶段-C语言实现</h3>
+
+<p>  高级阶段的入口函数是start_kernel，与内存管理相关的部分主要setup_arch中。</p>
+
+<p>  首先，我们会看到一些以memblock_打头的函数，这是干嘛的？我们应该知道，完整的内存初始化过程完成之前，正常的内存申请和释放功能是没法使用的。但是内核初始化过程中也需要动态分配内存，这就产生了矛盾。内核的做法是在初始化阶段使用一个简便的内存管理方法，这就是memblock。它从e820表中获知内存的分布情况，并以简单的连续分配方法来管理内存。所以在内核初始化阶段，它使用memblock来进行内存的申请和释放。</p>
+
+<p>  接着在init_mem_mapping中，内核将direct mapping区线性映射到整个物理空间。如此一来，内核便可访问所有物理内存了。大家可以回顾下Linux 3.10/Documentation/x86/x86_64/mm.txt。</p>
+
+<p>  再接着在initmem_init中，通过读取ACPI的SRAT表获知NUMA信息，并将这些信息更新到memblock中，此时内核就得知了完整的内存分布信息：有多少段内存，每段内存分别属于哪个NUMA节点。这里内核会为每个节点创建struct pglist_data结构，用来记录内存分布信息。</p>
+
+<p>  随后进入了和分页相关的初始化过程paging_init。这里又涉及内核的sparse_memory特性，这又是什么鬼？内核在管理内存时，是需要分配独立的内存页来记录内存信息的，比如struct page数组。早期的内核是按最大物理内存量固定分配，对于小内存场景，这种方法问题不大。然而当前系统内存越来越大(x86_64最大支持2^46)，而且内存可能动态增加(热插内存条)时，固定分配的方法就不适用了。sparse memory则以更灵活的方式来分配管理内存，如下图所示：</p>
+
+<div align="center">
+<img src="/images/posts/i440fx/memory6_1.jpg" height="400" width="500" />  
+</div>
+
+<p>  内核将所有内存(最大2^46)划分成区(128M)，并通过一个数组mem_section来记录每个区的信息。对于数组mem_section，是按4K页为粒度来分配空间，本质可以视为一个两维数组。内核通过memblock记录的信息为可用内存动态分配管理空间，不可用的区间将置为空，或者将section_mem_map低位清零(代表对应的区不存在)。在此过程中，内核也会对struct page数组分配空间，并将地址记录到section_mem_map中。</p>
+
+<p>  完成sparse memory的初始化后，内核通过free_area_init_nodes来初始化内核NUMA节点的空闲内存信息。此时页管理系统没有任何空闲内存。那么空闲内存是怎么来的？这就回到start_kernel中，它先通过build_all_zonelists建立分配zone序列，再通过mem_init调用free_all_bootmem，这里会把memblock中的空闲内存释放到页管理系统中。此后，内核就可以使用正常的alloc_pages函数来分配页了。</p>
+
+<p>  在2017年的最后几天里，终于把内核中有关内存管理方面的基础内容分析完了，但整个内存管理涉及的知识面非常广，还包括：反向映射、大页内存管理、KSM、cgroup_memory等多个方面。要想真正精通内存管理，需要坚持长期学习，并不断总结与实践。2018，继续努力！</p>
+
+<p><br />
+转载请注明：<a href="https://rootw.github.io">吴斌的博客</a> » <a href="https://rootw.github.io/2017/12/内存初始化/">【计算子系统】内存管理之六：内存初始化</a></p>
+
+
+  </section>
+</article>
+
+<section>
+       <ul class="pager">
+        
+        <li class="previous">
+            <a href="/2017/12/%E5%86%85%E5%AD%98%E5%8E%8B%E7%BC%A9/" data-toggle="tooltip" data-placement="top" title="【计算子系统】内存管理之五：内存压缩">上一篇：  <span>【计算子系统】内存管理之五：内存压缩</span>
+            </a>
+        </li>
+        
+        
+        <li class="next">
+            <a href="/2018/01/%E8%BF%9B%E7%A8%8B%E5%88%9B%E5%BB%BA/" data-toggle="tooltip" data-placement="top" title="【计算子系统】进程管理之一：进程创建">下一篇：  <span>【计算子系统】进程管理之一：进程创建</span>
+            </a>
+        </li>
+        
+    </ul>
+</section>
+
+<section class="post-comments">
+
+<div id="cloud-tie-wrapper" class="cloud-tie-wrapper"></div>
+<script>
+    var cloudTieConfig = {
+        url: document.location.href,
+        sourceId: "",
+        productKey: "da785706743641a2b774f3a6061e6a66",
+        target: "cloud-tie-wrapper"
+    };
+</script>
+<script src="https://img1.cache.netease.com/f2e/tie/yun/sdk/loader.js"></script>
+  
+  
+</section>
+
+
+            <section class="footer">
+    <footer>
+        <div class = "footer_div">  
+        <nav class="cover-navigation navigation--social">
+          <ul class="navigation">
+
+          
+
+          
+          <!-- Github -->
+          <li class="navigation__item_social">
+            <a href="https://github.com/rootw" title="@rootw 的 Github" target="_blank">
+              <i class='social fa fa-github fa-2x'></i>
+              <span class="label">Github</span>
+            </a>
+          </li>
+          
+          
+          
+
+          
+
+          <!-- RSS -->
+          <li class="navigation__item_social">
+            <a href="/feed.xml" rel="author" title="RSS" target="_blank">
+              <i class='social fa fa-rss fa-2x'></i>
+              <span class="label">RSS</span>
+            </a>
+          </li>
+
+          
+          <!-- Email -->
+          <li class="navigation__item_social">
+            <a href="mailto:wubin_zju@163.com" title="Contact me">
+              <i class='social fa fa-envelope fa-2x'></i>
+              <span class="label">Email</span>
+            </a>
+          </li>
+          
+
+          </ul>
+        </nav>
+
+        </div>
+
+        <div class = "footer_div">  
+           <p class="copyright text-muted">
+            Copyright &copy; 吴斌 2018 Theme by <a href="http://baixin.io/">leopardpan</a> |
+            <iframe
+                style="margin-left: 2px; margin-bottom:-5px;"
+                frameborder="0" scrolling="0" width="91px" height="20px"
+                src="https://ghbtns.com/github-btn.html?user=leopardpan&repo=leopardpan.github.io&type=star&count=true" >
+            </iframe>
+            </p>
+        	<div align="right">
+    			<link rel="stylesheet" href="//cdn.bootcss.com/font-awesome/4.3.0/css/font-awesome.min.css">
+
+          <!-- 访问统计 -->
+          <span id="busuanzi_container_site_pv">
+            本站总访问量
+            <span id="busuanzi_value_site_pv"></span>次
+          </span>
+
+        </div>
+        <div>
+    </footer>
+</section>
+
+        </div>
+    </div>
+    
+    <script type="text/javascript" src="//code.jquery.com/jquery-1.11.3.min.js"></script>
+<script type="text/javascript" src="/js/main.js"></script>
+
+<script type="text/javascript" src="/js/highlight.pack.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+
+
+
+
+    
+  </body>
+
+</html>

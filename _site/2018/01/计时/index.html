@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html>
+
+  <head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+
+  <title>【时间子系统】二、计时原理－timekeeper与clocksource</title>
+  <meta name="description" content="  本篇博文我们将深入分析一下内核是如何使用计时硬件对应用提供服务的。">
+  <meta name="author" content="leopardpan">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="【时间子系统】二、计时原理－timekeeper与clocksource">
+  <meta name="twitter:description" content="  本篇博文我们将深入分析一下内核是如何使用计时硬件对应用提供服务的。">
+  
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="【时间子系统】二、计时原理－timekeeper与clocksource">
+  <meta property="og:description" content="  本篇博文我们将深入分析一下内核是如何使用计时硬件对应用提供服务的。">
+  
+  <link rel="icon" type="image/png" href="/images/favicon.png" />
+  <link href="/images/favicon.png" rel="shortcut icon" type="image/png">
+  
+  <link rel="stylesheet" href="/css/main.css">
+  <link href="//netdna.bootstrapcdn.com/font-awesome/4.1.0/css/font-awesome.min.css" rel="stylesheet">
+
+  <link rel="canonical" href="http://localhost:4000/2018/01/%E8%AE%A1%E6%97%B6/">
+  <link rel="alternate" type="application/rss+xml" title="吴斌" href="http://localhost:4000/feed.xml">
+  
+  <meta name="google-site-verification" content="1-1ZlHoRvM0T2FqPbW2S-qLgYXN6rsn52kErlMPd_gw" />
+
+<!-- 站点统计 -->
+  <script 
+  async src="//dn-lbstatics.qbox.me/busuanzi/2.3/busuanzi.pure.mini.js">
+  </script>  
+
+<!-- 百度统计 -->
+  
+
+<!-- google 统计 -->
+  
+
+</head>
+
+
+  <body>
+
+    <span class="mobile btn-mobile-menu">        
+      <div class="nav_container">
+         <nav class="nav-menu-item" style = "float:right">
+            <i class="nav-menu-item">
+              <a href="/#blog" title="" class="blog-button">  博客主页
+              </a>
+            </i>
+            
+                <i class="nav-menu-item">
+
+                  <a href="/archive" title="archive" class="btn-mobile-menu__icon">
+                      所有文章
+                  </a>
+                </i>
+            
+                <i class="nav-menu-item">
+
+                  <a href="/tags" title="tags" class="btn-mobile-menu__icon">
+                      标签
+                  </a>
+                </i>
+            
+                <i class="nav-menu-item">
+
+                  <a href="/about" title="about" class="btn-mobile-menu__icon">
+                      关于我
+                  </a>
+                </i>
+            
+          </nav>
+      </div>
+    </span>
+    
+    <header class="panel-cover panel-cover--collapsed" style="background-image: url('/images/background-cover.jpg')">
+  <div class="panel-main">
+
+    <div class="panel-main__inner panel-inverted">
+    <div class="panel-main__content">
+        <!-- 头像效果-start -->
+        <div class="ih-item circle effect right_to_left">            
+            <a href="/#blog" title="前往 吴斌 的主页" class="blog-button">
+                <div class="img"><img src="/images/avatar.jpg" alt="img"></div>
+                <div class="info">
+                    <div class="info-back">
+                        <h2> 
+                            
+                                DigDeeply
+                            
+                        </h2>
+                        <p>
+                           
+                                系统编程<br>内核/虚拟化
+                            
+                        </p>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <!-- 头像效果-end -->
+        <h1 class="panel-cover__title panel-title"><a href="/#blog" title="link to homepage for 吴斌" class="blog-button">吴斌</a></h1>
+        
+        <span class="panel-cover__subtitle panel-subtitle">个人主页</span>
+        
+        <hr class="panel-cover__divider" />
+        <p class="panel-cover__description">欢迎来到我的技术博客~</p>
+        <hr class="panel-cover__divider panel-cover__divider--secondary" />
+        
+        
+        
+
+        <div class="navigation-wrapper">
+          <div>
+            <nav class="cover-navigation cover-navigation--primary">
+              <ul class="navigation">
+                <li class="navigation__item"><a href="/#blog" title="" class="blog-button">博客主页</a></li>
+                
+                  <li class="navigation__item"><a href="/archive" title="archive">所有文章</a></li>
+                
+                  <li class="navigation__item"><a href="/tags" title="tags">标签</a></li>
+                
+                  <li class="navigation__item"><a href="/about" title="about">关于我</a></li>
+                
+              </ul>
+            </nav>
+          </div>          
+        </div>
+
+
+        </div>
+      </div>
+    </div>
+    
+    
+    <div class="panel-cover--overlay cover-clear"></div>
+    
+  </div>
+</header>
+
+
+    <div class="content-wrapper">
+        <div class="content-wrapper__inner">
+            <article class="post-container post-container--single" itemscope itemtype="http://schema.org/BlogPosting">
+  <header class="post-header">
+    <h1 class="post-title">【时间子系统】二、计时原理－timekeeper与clocksource</h1>
+    <div class="post-meta">
+      <img src="/images/calendar.png" width="20px"/> 
+      <time datetime="2018-01-25 00:00:00 +0800" itemprop="datePublished" class="post-meta__date date">2018-01-25</time>  
+         
+      <span id="busuanzi_container_page_pv"> | 阅读：<span id="busuanzi_value_page_pv"></span>次</span>
+    </p>
+    </div>
+  </header>
+
+  <section class="post">
+    <p>  本篇博文我们将深入分析一下内核是如何使用计时硬件对应用提供服务的。</p>
+
+<h3 id="1-内核表示时间数据结构">1. 内核表示时间数据结构</h3>
+
+<p>  内核中对时间的表示有多种形式，可以使用在不同的应用场景。我们在时间概述中看到的gettimeofday的示例中，采用的数据结构是struct timeval，它的定义如下：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/include/uapi/linux/time.h:
+
+struct timeval {
+    __kernel_time_t         tv_sec;     /* seconds */
+    __kernel_suseconds_t    tv_usec;    /* microseconds */
+};
+</code></pre>
+</div>
+<p>  从上面的定义中，我们可以看到struct timeval记录了当前时间的秒数和毫秒数，精度就是毫秒。那么这里的秒数和毫秒数是相对哪个时间点(epoch)而言的呢？按照UNIX系统的习惯，记录时间的秒数和毫秒数是相对1970年1月1日00:00:00 +0000(UTC)而言的。另外，记录秒数的__kernel_time_t和记录毫秒的__kernel_suseconds_t在64位系统中都是long型的。</p>
+
+<p>  除了struct timeval，内核中还定义了精度更高的struct timespec，它的精度是纳秒：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/include/uapi/linux/time.h:
+
+struct timespec {
+    __kernel_time_t tv_sec;     /* seconds */
+    long            tv_nsec;    /* nanoseconds */
+};
+</code></pre>
+</div>
+
+<p>  此外，为了兼容各种系统架构，内核也定义了ktime_t类型，在64位机器中对应long，时间表示单位是纳秒：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/include/linux/ktime.h:
+
+union ktime {
+    s64	tv64;
+#if BITS_PER_LONG != 64 &amp;&amp; !defined(CONFIG_KTIME_SCALAR)
+    struct {
+#ifdef __BIG_ENDIAN
+        s32	sec, nsec;
+#else
+        s32	nsec, sec;
+#endif
+    } tv;
+#endif
+};
+
+typedef union ktime ktime_t;
+</code></pre>
+</div>
+
+<h3 id="2-内核时间类别">2. 内核时间类别</h3>
+
+<p>  时间概述中示例程序使用的gettimeofday将返回实时间(real time，或叫墙上时间wall time)，代表现实生活中使用的时间。除了墙上时间，内核也提供了线性时间(monotonic time，它不可调整，随系统运行线性增加，但不包括休眠时间)、启动时间(boot time，它也不可调整，并包括了休眠时间)等多种时间类型，以使应用在不同场景(获取不同类型时间的用户态方法是clock_gettime)，下表汇总了各类时间的要素点：</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>时间类别</th>
+      <th>精度</th>
+      <th>可手动调整</th>
+      <th>受NTP调整影响</th>
+      <th>时间起点</th>
+      <th>受闰秒影响</th>
+      <th>系统暂停时是否可工作</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>REALTIME</td>
+      <td>ns</td>
+      <td>YES</td>
+      <td>YES</td>
+      <td>Linux epoch</td>
+      <td>YES</td>
+      <td>NO</td>
+    </tr>
+    <tr>
+      <td>MONOTONIC</td>
+      <td>ns</td>
+      <td>NO</td>
+      <td>YES</td>
+      <td>Linux epoch</td>
+      <td>YES</td>
+      <td>NO</td>
+    </tr>
+    <tr>
+      <td>MONOTONIC_RAW</td>
+      <td>ns</td>
+      <td>NO</td>
+      <td>NO</td>
+      <td>Linux epoch</td>
+      <td>YES</td>
+      <td>NO</td>
+    </tr>
+    <tr>
+      <td>REALTIME_COARSE</td>
+      <td>tick</td>
+      <td>YES</td>
+      <td>YES</td>
+      <td>Linux epoch</td>
+      <td>YES</td>
+      <td>NO</td>
+    </tr>
+    <tr>
+      <td>MONOTONIC_COARSE</td>
+      <td>tick</td>
+      <td>NO</td>
+      <td>YES</td>
+      <td>Linux epoch</td>
+      <td>YES</td>
+      <td>NO</td>
+    </tr>
+    <tr>
+      <td>BOOTTIME</td>
+      <td>ns</td>
+      <td>NO</td>
+      <td>YES</td>
+      <td>machine start</td>
+      <td>YES</td>
+      <td>NO</td>
+    </tr>
+    <tr>
+      <td>REALTIME_ALARM</td>
+      <td>ns</td>
+      <td>YES</td>
+      <td>YES</td>
+      <td>Linux epoch</td>
+      <td>YES</td>
+      <td>YES</td>
+    </tr>
+    <tr>
+      <td>BOOTTIME_ALARM</td>
+      <td>ns</td>
+      <td>NO</td>
+      <td>YES</td>
+      <td>machine start</td>
+      <td>YES</td>
+      <td>YES</td>
+    </tr>
+    <tr>
+      <td>TAI</td>
+      <td>ns</td>
+      <td>NO</td>
+      <td>NO</td>
+      <td>Linux epoch</td>
+      <td>NO</td>
+      <td>NO</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>  关于闰秒，我们需要先理解什么是原子秒？原子秒提出的背景是人们对于”秒”的精确定义追求。多长时间可以算作1秒？这是一个很难准确回答的问题。但是后来科学家发现铯133原子在能量跃迁时辐射的电磁波振荡频率非常稳定，因此就被用来定义时间的基本单位：秒，即原子秒。通过原子秒延展出来的时间轴就是TAI(International Atomic Time)。原子时间虽然精准，但是对人类来说不太友好，它和传统的地球自转和公转的周期性自然现象存在时间差。在这样的背景下，UTC(Coordinated Universal Time)被提出。它使用原子秒作为计时单位，但又会适当调整以适应人们的日常生活。这个调整的时间差就是闰秒。TAI和UTC在1972进行了校准，两者相差10秒，从此后到2017年，又调整了27次，因此TAI比UTC快了37秒。</p>
+
+<h3 id="3-深入do_gettimeofday">3. 深入do_gettimeofday</h3>
+
+<p>  用户态gettimeofday接口在内核中是通过do_gettimeofday实现的，从调用层次上看，它可以分为timekeeper和clocksource两层。</p>
+
+<h4 id="31-timekeeper"><strong>3.1 timekeeper</strong></h4>
+
+<p>  timekeeper是内核中负责计时功能的核心对象，它通过使用当前系统中最优的clocksource来提供时间服务：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/kernel/time/timekeeping.c:
+
+/**
+ * do_gettimeofday - Returns the time of day in a timeval
+ * @tv:		pointer to the timeval to be set
+ *
+ * NOTE: Users should be converted to using getnstimeofday()
+ */
+void do_gettimeofday(struct timeval *tv)
+{
+    struct timespec now;
+
+    getnstimeofday(&amp;now); /*获取纳秒精度的当前时间*/
+    tv-&gt;tv_sec = now.tv_sec;
+    tv-&gt;tv_usec = now.tv_nsec/1000;
+}
+
+/**
+ * __getnstimeofday - Returns the time of day in a timespec.
+ * @ts:		pointer to the timespec to be set
+ *
+ * Updates the time of day in the timespec.
+ * Returns 0 on success, or -ve when suspended (timespec will be undefined).
+ */
+int __getnstimeofday(struct timespec *ts)
+{
+    struct timekeeper *tk = &amp;timekeeper; /*系统全局对象timekeeper*/
+    unsigned long seq;
+    s64 nsecs = 0;
+
+    do {
+        seq = read_seqcount_begin(&amp;timekeeper_seq); /*以顺序锁来同步各个任务对timekeeper的读写操作*/
+
+        ts-&gt;tv_sec = tk-&gt;xtime_sec; /*获取最近更新的墙上时间的秒数(墙上时间会周期性地被更新，将在定时原理部分讨论)*/
+        nsecs = timekeeping_get_ns(tk); /*获取当前墙上时间相对(tk-&gt;xtime_sec, 0)的纳秒时间间隔*/
+
+    } while (read_seqcount_retry(&amp;timekeeper_seq, seq));
+
+    ts-&gt;tv_nsec = 0;
+    timespec_add_ns(ts, nsecs);/*累加前面获取的纳秒时间间隔以得到正确的当前墙上时间；有可能导致秒数进位*/
+
+    ...
+    return 0;
+}
+
+static inline s64 timekeeping_get_ns(struct timekeeper *tk)
+{
+    cycle_t cycle_now, cycle_delta;
+    struct clocksource *clock;
+    s64 nsec;
+
+    /*通过当前最优clocksource获取当前时间计数cycle；不同的clocksource可以提供不同的read实现*/
+    /* read clocksource: */
+    clock = tk-&gt;clock;
+    cycle_now = clock-&gt;read(clock);
+    
+    /*通过clocksource中的当前计数值与最近一次更新墙上时间时获取的值的差值来计算时间间隔*/
+
+    /* calculate the delta since the last update_wall_time: */    
+    cycle_delta = (cycle_now - clock-&gt;cycle_last) &amp; clock-&gt;mask;
+
+    /*tk-&gt;mult和tk-&gt;shift是用来进行将cycle数值转成纳秒的转换参数，参见clocksource中的说明*/
+    nsec = cycle_delta * tk-&gt;mult + tk-&gt;xtime_nsec; /*tk-&gt;xtime_nsec是最近更新的墙上时间的秒纳数左移tk-&gt;shift后的值*/
+    nsec &gt;&gt;= tk-&gt;shift;
+
+    /* If arch requires, add in get_arch_timeoffset() */
+    return nsec + get_arch_timeoffset();
+}
+</code></pre>
+</div>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/include/linux/timekeeper_internal.h:
+
+/* Structure holding internal timekeeping values. */
+struct timekeeper {
+    /* Current clocksource used for timekeeping. */
+    struct clocksource	*clock;
+    /* NTP adjusted clock multiplier */
+    u32			mult;
+    /* The shift value of the current clocksource. */
+    u32			shift;
+    /* Number of clock cycles in one NTP interval. */
+    cycle_t			cycle_interval;
+    /* Last cycle value (also stored in clock-&gt;cycle_last) */
+    cycle_t			cycle_last;
+    /* Number of clock shifted nano seconds in one NTP interval. */
+    u64			xtime_interval;
+    /* shifted nano seconds left over when rounding cycle_interval */
+    s64			xtime_remainder;
+    /* Raw nano seconds accumulated per NTP interval. */
+    u32			raw_interval;
+
+    /* Current CLOCK_REALTIME time in seconds */
+    u64			xtime_sec;
+    /* Clock shifted nano seconds */
+    u64			xtime_nsec;
+
+    /* Difference between accumulated time and NTP time in ntp
+     * shifted nano seconds. */
+    s64			ntp_error;
+    /* Shift conversion between clock shifted nano seconds and
+     * ntp shifted nano seconds. */
+    u32			ntp_error_shift;
+
+    /*
+     * wall_to_monotonic is what we need to add to xtime (or xtime corrected
+     * for sub jiffie times) to get to monotonic time.  Monotonic is pegged
+     * at zero at system boot time, so wall_to_monotonic will be negative,
+     * however, we will ALWAYS keep the tv_nsec part positive so we can use
+     * the usual normalization.
+     *
+     * wall_to_monotonic is moved after resume from suspend for the
+     * monotonic time not to jump. We need to add total_sleep_time to
+     * wall_to_monotonic to get the real boot based time offset.
+     *
+     * - wall_to_monotonic is no longer the boot time, getboottime must be
+     * used instead.
+     */
+    struct timespec		wall_to_monotonic;
+    /* Offset clock monotonic -&gt; clock realtime */
+    ktime_t			offs_real;
+    /* time spent in suspend */
+    struct timespec		total_sleep_time;
+    /* Offset clock monotonic -&gt; clock boottime */
+    ktime_t			offs_boot;
+    /* The raw monotonic time for the CLOCK_MONOTONIC_RAW posix clock. */
+    struct timespec		raw_time;
+    /* The current UTC to TAI offset in seconds */
+    s32			tai_offset;
+    /* Offset clock monotonic -&gt; clock tai */
+    ktime_t			offs_tai;
+
+};
+</code></pre>
+</div>
+
+<h4 id="32-clocksource"><strong>3.2 clocksource</strong></h4>
+
+<p>  内核通过clocksource对象来描述物理计时设备，x86架构下最常见的计时设备是tsc，我们来看看tsc对应的clocksource:</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/arch/x86/kernel/tsc.c:
+
+static struct clocksource clocksource_tsc = {
+    .name                   = "tsc",
+    .rating                 = 300,
+    .read                   = read_tsc,
+    .resume                 = resume_tsc,
+    .mask                   = CLOCKSOURCE_MASK(64),
+    .flags                  = CLOCK_SOURCE_IS_CONTINUOUS |
+                              CLOCK_SOURCE_MUST_VERIFY,
+};
+</code></pre>
+</div>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/include/linux/clocksource.h:
+
+/**
+ * struct clocksource - hardware abstraction for a free running counter
+ *	Provides mostly state-free accessors to the underlying hardware.
+ *	This is the structure used for system time.
+ *
+ * @name:		ptr to clocksource name
+ * @list:		list head for registration
+ * @rating:		rating value for selection (higher is better)
+ *			To avoid rating inflation the following
+ *			list should give you a guide as to how
+ *			to assign your clocksource a rating
+ *			1-99: Unfit for real use
+ *				Only available for bootup and testing purposes.
+ *			100-199: Base level usability.
+ *				Functional for real use, but not desired.
+ *			200-299: Good.
+ *				A correct and usable clocksource.
+ *			300-399: Desired.
+ *				A reasonably fast and accurate clocksource.
+ *			400-499: Perfect
+ *				The ideal clocksource. A must-use where
+ *				available.
+ * @read:		returns a cycle value, passes clocksource as argument
+ * @enable:		optional function to enable the clocksource
+ * @disable:		optional function to disable the clocksource
+ * @mask:		bitmask for two's complement
+ *			subtraction of non 64 bit counters
+ * @mult:		cycle to nanosecond multiplier
+ * @shift:		cycle to nanosecond divisor (power of two)
+ * @max_idle_ns:	max idle time permitted by the clocksource (nsecs)
+ * @maxadj:		maximum adjustment value to mult (~11%)
+ * @flags:		flags describing special properties
+ * @archdata:		arch-specific data
+ * @suspend:		suspend function for the clocksource, if necessary
+ * @resume:		resume function for the clocksource, if necessary
+ * @cycle_last:		most recent cycle counter value seen by ::read()
+ */
+struct clocksource {
+    /*
+     * Hotpath data, fits in a single cache line when the
+     * clocksource itself is cacheline aligned.
+     */
+    cycle_t (*read)(struct clocksource *cs);
+    cycle_t cycle_last;
+    cycle_t mask;
+    u32 mult;
+    u32 shift;
+    u64 max_idle_ns;
+    u32 maxadj;
+#ifdef CONFIG_ARCH_CLOCKSOURCE_DATA
+    struct arch_clocksource_data archdata;
+#endif
+
+    const char *name;
+    struct list_head list;
+    int rating;
+    int (*enable)(struct clocksource *cs);
+    void (*disable)(struct clocksource *cs);
+        unsigned long flags;
+    void (*suspend)(struct clocksource *cs);
+    void (*resume)(struct clocksource *cs);
+
+    /* private: */
+#ifdef CONFIG_CLOCKSOURCE_WATCHDOG
+    /* Watchdog related data, used by the framework */
+    struct list_head wd_list;
+    cycle_t cs_last;
+    cycle_t wd_last;
+#endif
+} ____cacheline_aligned;
+</code></pre>
+</div>
+
+<p>  上面代码的注释部分已经清楚地解析了tsc是一种精度良好的clocksource，我们可以使用read_tsc(本质是通过rdtsc指令)来获取当前tsc计数值。cycle_last表示最近一次从clocksource中获取的cycle计数值；mask表示当前clocksource中计数器的有效位数；mult和shift用来计算从cycle到纳秒的转换；max_idle_ns表示当前clocksource允许的最长时间更新间隔，因为如果CPU长期不更新时间，将会导致再次获取到的cycle计数值过大，使得转换成纳秒时发生溢出错误。从理论计算上说，将cycle转换成纳秒的公式是”cycle * 每秒纳秒数 / 频率”，但是由于内核无法进行浮点运算，只能通过一种变通的方法来计算，即”cycle * mult » shift”，这里的mult和shif就是基于频率、计算精度和最大表示范围计算而得的。</p>
+
+<h3 id="4-计时初始化">4. 计时初始化</h3>
+
+<p>  最后我们再来看看内核计时功能的初始化过程，了解一下计时功能是如何一步步生效的。timekeeper的初始化是在内核启动过程start_kernel中调用timekeeping_init进行：</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/kernel/time/timekeeping.c:
+
+/*
+ * timekeeping_init - Initializes the clocksource and common timekeeping values
+ */
+void __init timekeeping_init(void)
+{
+    struct timekeeper *tk = &amp;timekeeper;
+    struct clocksource *clock;
+    unsigned long flags;
+    struct timespec now, boot, tmp;
+
+    /*x86架构下，persistent clock为系统RTC时钟源，我们先从中获取当前时间，精度为秒*/
+    read_persistent_clock(&amp;now);
+
+    if (!timespec_valid_strict(&amp;now)) {
+        pr_warn("WARNING: Persistent clock returned invalid value!\n"
+                "         Check your CMOS/BIOS settings.\n");
+        now.tv_sec = 0;
+        now.tv_nsec = 0;
+    } else if (now.tv_sec || now.tv_nsec)
+        persistent_clock_exist = true;
+
+    /*x86架构下，没有boot clock，所以boot time为0*/
+    read_boot_clock(&amp;boot);
+    if (!timespec_valid_strict(&amp;boot)) {
+        pr_warn("WARNING: Boot clock returned invalid value!\n"
+                "         Check your CMOS/BIOS settings.\n");
+        boot.tv_sec = 0;
+        boot.tv_nsec = 0;
+    }
+
+    raw_spin_lock_irqsave(&amp;timekeeper_lock, flags);
+    write_seqcount_begin(&amp;timekeeper_seq);
+    ntp_init();
+
+    /*获取系统默认时钟源，x86架构中即为jiffies*/
+    clock = clocksource_default_clock();
+    if (clock-&gt;enable)
+    clock-&gt;enable(clock);
+    /*将jiffy设备timekeeper中的时钟源并设定内部相关变量*/
+    tk_setup_internals(tk, clock);
+
+    /*将当前时间设定为tk的墙上时间，注其中tk-&gt;xtime_sec为当前秒数，tk-&gt;xtime_nsec为纳秒左移shift位后的值*/
+    tk_set_xtime(tk, &amp;now);
+    /*raw_time设为0*/
+    tk-&gt;raw_time.tv_sec = 0;
+    tk-&gt;raw_time.tv_nsec = 0;
+    /*boot time设为墙上时间*/
+    if (boot.tv_sec == 0 &amp;&amp; boot.tv_nsec == 0)
+        boot = tk_xtime(tk);
+
+    /*将monotonic time减去wall time的时间偏移记录下来*/
+    set_normalized_timespec(&amp;tmp, -boot.tv_sec, -boot.tv_nsec);
+    tk_set_wall_to_mono(tk, tmp);
+
+    /*将sleep time初始化为零*/
+    tmp.tv_sec = 0;
+    tmp.tv_nsec = 0;
+    tk_set_sleep_time(tk, tmp);
+
+    /*备份当前timekeeper*/
+    memcpy(&amp;shadow_timekeeper, &amp;timekeeper, sizeof(timekeeper));
+
+    write_seqcount_end(&amp;timekeeper_seq);
+    raw_spin_unlock_irqrestore(&amp;timekeeper_lock, flags);
+}
+</code></pre>
+</div>
+
+<p>  内核jiffies变量代表时间滴答，是对同期性tick事件的记数，因此可以将它视为一个最为简单的时钟源。它和一般时钟源的不同之处在于它没有实际的计时设备与之对应，完全是记录在计算机内存中；另外它的精度和系统tick数相关。</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/kernel/time/jiffies.c:
+
+struct clocksource * __init __weak clocksource_default_clock(void)
+{
+    return &amp;clocksource_jiffies;
+}
+
+static struct clocksource clocksource_jiffies = {
+    .name		= "jiffies",
+    .rating		= 1, /* lowest valid rating*/
+    .read		= jiffies_read,
+    .mask		= 0xffffffff, /*32bits*/
+    .mult		= NSEC_PER_JIFFY &lt;&lt; JIFFIES_SHIFT, /* details above */
+    .shift		= JIFFIES_SHIFT,
+};
+
+static cycle_t jiffies_read(struct clocksource *cs)
+{
+    return (cycle_t) jiffies;
+}
+</code></pre>
+</div>
+
+<p>  对于tsc时钟源，在内核对模块进行初始化时，会注册tsc时钟，并通知timekeeper将时钟源从jiffies切换到tsc:</p>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>static int __init init_tsc_clocksource(void)
+{
+    ...
+    if (boot_cpu_has(X86_FEATURE_TSC_RELIABLE)) {
+        /*注册一个频率为tsc_khz的时钟源，最终调用__clocksource_register_scale实现*/
+        clocksource_register_khz(&amp;clocksource_tsc, tsc_khz);
+    return 0;
+    }
+    ...
+}
+/*
+ * We use device_initcall here, to ensure we run after the hpet
+ * is fully initialized, which may occur at fs_initcall time.
+ */
+device_initcall(init_tsc_clocksource);
+</code></pre>
+</div>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/kernel/time/clocksource.c:
+
+/**
+ * __clocksource_register_scale - Used to install new clocksources
+ * @cs:		clocksource to be registered
+ * @scale:	Scale factor multiplied against freq to get clocksource hz
+ * @freq:	clocksource frequency (cycles per second) divided by scale
+ *
+ * Returns -EBUSY if registration fails, zero otherwise.
+ *
+ * This *SHOULD NOT* be called directly! Please use the
+ * clocksource_register_hz() or clocksource_register_khz helper functions.
+ */
+int __clocksource_register_scale(struct clocksource *cs, u32 scale, u32 freq)
+{
+
+    /*首先根据时钟源的频率计算合适的mult和shift，以及最大更新延时max_idle_ns*/
+    /* Initialize mult/shift and max_idle_ns */
+    __clocksource_updatefreq_scale(cs, scale, freq);
+
+    /* Add clocksource to the clcoksource list */
+    mutex_lock(&amp;clocksource_mutex);
+    clocksource_enqueue(cs); /*加入到全局clocksource_list*/
+    clocksource_enqueue_watchdog(cs); /*加入到时钟源监控中，如果发现当前时钟源精度下降会重新选择更优的时钟源*/
+    clocksource_select(); /*选择最优的时钟源，内部会调用timekeeping_notify通知timerkeeper*/
+    mutex_unlock(&amp;clocksource_mutex);
+    return 0;
+}
+</code></pre>
+</div>
+
+<div class="highlighter-rouge"><pre class="highlight"><code>linux/kernel/time/timekeeping.c:
+
+/**
+* timekeeping_notify - Install a new clock source
+* @clock:		pointer to the clock source
+*
+* This function is called from clocksource.c after a new, better clock
+* source has been registered. The caller holds the clocksource_mutex.
+*/
+void timekeeping_notify(struct clocksource *clock)
+{
+    struct timekeeper *tk = &amp;timekeeper;
+
+    if (tk-&gt;clock == clock)
+        return;
+    /*注意，这里会暂停所有CPU的运行，并选定一个默认的CPU(0号核)执行change_clocksource。
+      这是因为时钟源是计时的基础，在进行时钟源切换时系统将无法提供正确的时间服务。只有当切换
+      完成后系统才可恢复运行。*/
+    stop_machine(change_clocksource, clock, NULL);
+    tick_clock_notify();
+}
+
+/**
+ * change_clocksource - Swaps clocksources if a new one is available
+ *
+ * Accumulates current time interval and initializes new clocksource
+ */
+static int change_clocksource(void *data)
+{
+    struct timekeeper *tk = &amp;timekeeper;
+    struct clocksource *new, *old;
+    unsigned long flags;
+
+    new = (struct clocksource *) data;
+
+    raw_spin_lock_irqsave(&amp;timekeeper_lock, flags);
+    write_seqcount_begin(&amp;timekeeper_seq);
+
+    timekeeping_forward_now(tk);
+    if (!new-&gt;enable || new-&gt;enable(new) == 0) {
+        old = tk-&gt;clock;
+        tk_setup_internals(tk, new);
+        if (old-&gt;disable)
+            old-&gt;disable(old);
+    }
+    timekeeping_update(tk, true, true);
+
+    write_seqcount_end(&amp;timekeeper_seq);
+    raw_spin_unlock_irqrestore(&amp;timekeeper_lock, flags);
+
+    return 0;
+}
+</code></pre>
+</div>
+
+<p><br />
+转载请注明：<a href="https://rootw.github.io">吴斌的博客</a> » <a href="https://rootw.github.io/2018/01/计时/">【时间子系统】二、计时原理－timekeeper与clocksource</a></p>
+
+
+  </section>
+</article>
+
+<section>
+       <ul class="pager">
+        
+        <li class="previous">
+            <a href="/2018/01/%E6%97%B6%E9%97%B4%E5%AD%90%E7%B3%BB%E7%BB%9F%E6%A6%82%E8%BF%B0/" data-toggle="tooltip" data-placement="top" title="【时间子系统】一、概述">上一篇：  <span>【时间子系统】一、概述</span>
+            </a>
+        </li>
+        
+        
+        <li class="next">
+            <a href="/2018/02/%E6%97%B6%E9%92%9F%E4%B8%AD%E6%96%AD/" data-toggle="tooltip" data-placement="top" title="【时间子系统】三、时钟中断－定时基础">下一篇：  <span>【时间子系统】三、时钟中断－定时基础</span>
+            </a>
+        </li>
+        
+    </ul>
+</section>
+
+<section class="post-comments">
+
+<div id="cloud-tie-wrapper" class="cloud-tie-wrapper"></div>
+<script>
+    var cloudTieConfig = {
+        url: document.location.href,
+        sourceId: "",
+        productKey: "da785706743641a2b774f3a6061e6a66",
+        target: "cloud-tie-wrapper"
+    };
+</script>
+<script src="https://img1.cache.netease.com/f2e/tie/yun/sdk/loader.js"></script>
+  
+  
+</section>
+
+
+            <section class="footer">
+    <footer>
+        <div class = "footer_div">  
+        <nav class="cover-navigation navigation--social">
+          <ul class="navigation">
+
+          
+
+          
+          <!-- Github -->
+          <li class="navigation__item_social">
+            <a href="https://github.com/rootw" title="@rootw 的 Github" target="_blank">
+              <i class='social fa fa-github fa-2x'></i>
+              <span class="label">Github</span>
+            </a>
+          </li>
+          
+          
+          
+
+          
+
+          <!-- RSS -->
+          <li class="navigation__item_social">
+            <a href="/feed.xml" rel="author" title="RSS" target="_blank">
+              <i class='social fa fa-rss fa-2x'></i>
+              <span class="label">RSS</span>
+            </a>
+          </li>
+
+          
+          <!-- Email -->
+          <li class="navigation__item_social">
+            <a href="mailto:wubin_zju@163.com" title="Contact me">
+              <i class='social fa fa-envelope fa-2x'></i>
+              <span class="label">Email</span>
+            </a>
+          </li>
+          
+
+          </ul>
+        </nav>
+
+        </div>
+
+        <div class = "footer_div">  
+           <p class="copyright text-muted">
+            Copyright &copy; 吴斌 2018 Theme by <a href="http://baixin.io/">leopardpan</a> |
+            <iframe
+                style="margin-left: 2px; margin-bottom:-5px;"
+                frameborder="0" scrolling="0" width="91px" height="20px"
+                src="https://ghbtns.com/github-btn.html?user=leopardpan&repo=leopardpan.github.io&type=star&count=true" >
+            </iframe>
+            </p>
+        	<div align="right">
+    			<link rel="stylesheet" href="//cdn.bootcss.com/font-awesome/4.3.0/css/font-awesome.min.css">
+
+          <!-- 访问统计 -->
+          <span id="busuanzi_container_site_pv">
+            本站总访问量
+            <span id="busuanzi_value_site_pv"></span>次
+          </span>
+
+        </div>
+        <div>
+    </footer>
+</section>
+
+        </div>
+    </div>
+    
+    <script type="text/javascript" src="//code.jquery.com/jquery-1.11.3.min.js"></script>
+<script type="text/javascript" src="/js/main.js"></script>
+
+<script type="text/javascript" src="/js/highlight.pack.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+
+
+
+
+    
+  </body>
+
+</html>
