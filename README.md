@@ -1,6 +1,7 @@
 ### 我的博客
 
-地址：[http://yansu.org](http://yansu.org)
+地址：[http://yiwenjiangeric.github.io](http://yiwenjiangeric.github.io)
+Fork from yansu的博客[http://yansu.org](http://yansu.org)
 
 ### 安装说明
 
